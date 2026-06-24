@@ -48,6 +48,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <Link href="/alerts" style={navLink}>
               实时告警
             </Link>
+            <Link href="/accumulation" style={navLink}>
+              拆单累计
+            </Link>
           </div>
         </nav>
         {children}
