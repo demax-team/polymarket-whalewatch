@@ -1,12 +1,45 @@
 import { TradeSchema, type Trade } from "./types";
 import { z } from "zod";
 const DATA_API = "https://data-api.polymarket.com";
+
+// The public Data API (Cloudflare front) intermittently returns 408/5xx on
+// expensive queries (high filterAmount + side filter) — the origin times out
+// around ~5.75s. These are transient: a retry almost always succeeds (and warms
+// the CDN, so the next attempt is fast). Bounded exponential backoff so a
+// probabilistic 408 never surfaces to the user as a scan failure.
+const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+async function fetchTrades(
+  url: string,
+  attempts = 4,
+  baseDelayMs = 300,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(12_000) });
+      if (res.ok || !TRANSIENT_STATUS.has(res.status) || i === attempts - 1) {
+        return res;
+      }
+      console.warn(
+        `[fetchTrades] transient ${res.status}, retry ${i + 1}/${attempts}`,
+      );
+    } catch (e) {
+      lastErr = e;
+      if (i === attempts - 1) throw e;
+      console.warn(`[fetchTrades] fetch error, retry ${i + 1}/${attempts}`);
+    }
+    await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** i));
+  }
+  if (lastErr) throw lastErr;
+  throw new Error("fetchTrades: retries exhausted");
+}
+
 export async function getLargeTrades(
   minUsd: number,
   limit = 500,
 ): Promise<Trade[]> {
   const url = `${DATA_API}/trades?filterType=CASH&filterAmount=${minUsd}&takerOnly=true&limit=${limit}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  const res = await fetchTrades(url);
   if (!res.ok) throw new Error(`getLargeTrades ${res.status}`);
   const raw = await res.json();
   const parsed = z.array(TradeSchema).safeParse(raw);
@@ -54,7 +87,7 @@ export async function getTradesWindow({
   for (let page = 0; page < maxPages; page++) {
     const sideParam = side ? `&side=${side}` : "";
     const url = `${DATA_API}/trades?filterType=CASH&filterAmount=${minUsd}&takerOnly=true&limit=500&offset=${page * 500}${sideParam}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const res = await fetchTrades(url);
     if (!res.ok) throw new Error(`getTradesWindow ${res.status}`);
     const raw = await res.json();
     const parsed = z.array(TradeSchema).safeParse(raw);

@@ -158,3 +158,20 @@ it("getTradesWindow returns truncated:true when it hits the page cap with all ro
   expect(trades).toHaveLength(1000); // 2 full pages
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
+
+it("getTradesWindow retries a transient 408 then succeeds", async () => {
+  const sinceSec = 1700000000;
+  const page = [
+    trade({ timestamp: sinceSec + 100, transactionHash: "0xa" }),
+    trade({ timestamp: sinceSec - 1, transactionHash: "0xb" }),
+  ];
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: false, status: 408, json: async () => ({}) })
+    .mockResolvedValueOnce({ ok: true, json: async () => page });
+  vi.stubGlobal("fetch", fetchMock);
+  const { trades } = await getTradesWindow({ minUsd: 100000, sinceSec });
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(trades).toHaveLength(1);
+  expect(trades[0].transactionHash).toBe("0xa");
+});

@@ -41,12 +41,21 @@ const EMPTY_STATS: ScanStats = {
   maxTrade: null,
 };
 
-// Module-level TTL cache (~20s) keyed by minUsd:side:hours. The live Data API is
-// the same for every visitor, so caching avoids hammering it when a user clicks
-// rapidly through filters. Cache is per-process; force-dynamic only disables
-// Next's own caching, so we do it explicitly here.
+// The Data API's server-side `filterAmount` is FAST when dense (low threshold)
+// but the origin times out (~5.75s → 408) on high thresholds because matching
+// trades are sparse and it scans huge history to fill a page. So we ALWAYS fetch
+// at a low, fast floor and apply the user's (higher) amount + side filters in
+// memory. The low-floor result is a superset of any higher threshold, so the
+// filtered output is exact — and switching amount/side is instant (no refetch).
+const SAFE_FLOOR = 10_000;
+
+// Cache the BASE fetch keyed by floor:hours (NOT by amount/side — those are
+// applied client-side). ~20s TTL so rapid filter changes don't hammer the API.
 const CACHE_TTL_MS = 20_000;
-const cache = new Map<string, { at: number; body: ScanResponse }>();
+const cache = new Map<
+  string,
+  { at: number; trades: Trade[]; truncated: boolean }
+>();
 
 const ALLOWED_HOURS = new Set([1, 6, 24]);
 
@@ -97,30 +106,35 @@ export async function GET(req: Request) {
   const minUsd = parseMinUsd(url.searchParams.get("minUsd"));
   const side = parseSide(url.searchParams.get("side"));
   const hours = clampHours(url.searchParams.get("hours"));
-
   const filters = { minUsd, side, hours };
-  const key = `${minUsd}:${side}:${hours}`;
 
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
-    return Response.json(hit.body);
-  }
+  // Fetch at a fast floor; never ask the origin for a slow high-amount query.
+  const baseFloor = Math.min(minUsd, SAFE_FLOOR);
+  const baseKey = `${baseFloor}:${hours}`;
 
   try {
-    const sinceSec = Math.floor(Date.now() / 1000) - hours * 3600;
-    const { trades: raw, truncated } = await getTradesWindow({
-      minUsd,
-      side: side === "ALL" ? undefined : side,
-      sinceSec,
-    });
-    const trades = raw.map(toScanTrade);
+    let base = cache.get(baseKey);
+    if (!base || Date.now() - base.at >= CACHE_TTL_MS) {
+      const sinceSec = Math.floor(Date.now() / 1000) - hours * 3600;
+      // No side filter at fetch time — fetch both sides once, filter side in memory.
+      const { trades, truncated } = await getTradesWindow({
+        minUsd: baseFloor,
+        sinceSec,
+      });
+      base = { at: Date.now(), trades, truncated };
+      cache.set(baseKey, base);
+    }
+
+    const filtered = base.trades
+      .map(toScanTrade)
+      .filter((t) => t.usd >= minUsd && (side === "ALL" || t.side === side));
+
     const body: ScanResponse = {
       filters,
-      stats: computeStats(trades),
-      truncated,
-      trades,
+      stats: computeStats(filtered),
+      truncated: base.truncated,
+      trades: filtered,
     };
-    cache.set(key, { at: Date.now(), body });
     return Response.json(body);
   } catch (error) {
     // Never 500 the UI: degrade to empty stats plus an error string the page can show.
