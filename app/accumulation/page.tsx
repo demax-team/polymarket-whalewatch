@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatAge, ageColor } from "../ageFormat";
 
 type AccumGroup = {
   wallet: string;
@@ -99,6 +100,9 @@ export default function AccumulationPage() {
   // Sorting is purely client-side over the already-fetched rows.
   const [sortKey, setSortKey] = useState<SortKey>("net");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  // wallet(lowercased) -> ageDays|null. Filled lazily after the table renders;
+  // permanently cached server-side so repeat lookups are instant.
+  const [ages, setAges] = useState<Record<string, number | null>>({});
 
   const activeReq = useRef<number>(0);
 
@@ -138,6 +142,43 @@ export default function AccumulationPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Lazily enrich rows with address age. Collect distinct wallets not yet resolved,
+  // POST them, and merge ageDays into `ages` (keyed by lowercased wallet).
+  useEffect(() => {
+    const groups = data?.groups;
+    if (!groups || groups.length === 0) return;
+    const want = [
+      ...new Set(
+        groups
+          .map((g) => g.wallet?.toLowerCase())
+          .filter((w): w is string => Boolean(w)),
+      ),
+    ].filter((w) => !(w in ages));
+    if (want.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/wallet-age", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wallets: want }),
+        });
+        const json = (await res.json()) as {
+          ages?: Record<string, { ageDays: number | null }>;
+        };
+        if (cancelled) return;
+        const next: Record<string, number | null> = {};
+        for (const w of want) next[w] = json.ages?.[w]?.ageDays ?? null;
+        setAges((prev) => ({ ...prev, ...next }));
+      } catch {
+        // Best-effort enrichment; leave unresolved wallets showing "…".
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [data, ages]);
 
   function applyCustom() {
     const n = Number(customText);
@@ -365,6 +406,7 @@ export default function AccumulationPage() {
             <thead>
               <tr>
                 <th style={headStyle}>钱包</th>
+                <th style={headStyle}>地址年龄</th>
                 <th style={headStyle}>市场 · 结果</th>
                 <th
                   style={{
@@ -432,6 +474,20 @@ export default function AccumulationPage() {
                       >
                         {shortWallet(g.wallet)}
                       </a>
+                    </td>
+                    <td style={cellStyle}>
+                      {(() => {
+                        const { text, tone } = formatAge(
+                          ages[g.wallet?.toLowerCase()],
+                        );
+                        return (
+                          <span
+                            style={{ color: ageColor[tone], fontWeight: 600 }}
+                          >
+                            {text}
+                          </span>
+                        );
+                      })()}
                     </td>
                     <td
                       style={{
