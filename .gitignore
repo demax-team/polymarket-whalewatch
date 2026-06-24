@@ -17,3 +17,5 @@ sample_*.json
 
 # session artifacts
 .claude/
+.playwright-mcp/
+next-env.d.ts
