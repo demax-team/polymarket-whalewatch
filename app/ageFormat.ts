@@ -9,6 +9,12 @@ export function formatAge(ageDays: number | null | undefined): {
   tone: AgeTone;
 } {
   if (ageDays == null) return { text: "…", tone: "unknown" };
+  if (ageDays < 1) {
+    // Under a day: drop to hours (or minutes for very fresh) — brand-new wallets matter most.
+    const mins = Math.round(ageDays * 1440);
+    if (mins < 60) return { text: `🆕 ${Math.max(1, mins)}分钟`, tone: "new" };
+    return { text: `🆕 ${Math.round(ageDays * 24)}小时`, tone: "new" };
+  }
   const d = Math.floor(ageDays);
   if (d <= 30) return { text: `🆕 ${d}天`, tone: d < 7 ? "new" : "young" };
   if (d < 365)
