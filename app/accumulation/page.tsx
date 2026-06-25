@@ -1,7 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { formatAge, ageColor } from "../ageFormat";
+
+type AccumBuy = {
+  ts: number;
+  usd: number;
+  price: number;
+};
 
 type AccumGroup = {
   wallet: string;
@@ -15,6 +28,11 @@ type AccumGroup = {
   buyCount: number;
   sellCount: number;
   maxSingleBuyUsd: number;
+  buyShares: number;
+  avgBuyPrice: number;
+  firstTs: number;
+  lastTs: number;
+  buys: AccumBuy[];
 };
 
 type AccumStats = {
@@ -27,15 +45,32 @@ type AccumResponse = {
   filters: { floor: number; hours: number; minNetUsd: number };
   stats: AccumStats;
   truncated: boolean;
+  oldestTs: number | null;
   groups: AccumGroup[];
   error?: string;
 };
 
 type Hours = 1 | 2 | 4;
+type Floor = 500 | 1000 | 2000;
 type SortKey = "net" | "buyCount" | "maxSingle" | "buyUsd";
 
 const NET_PRESETS = [10000, 25000, 50000];
+const FLOOR_PRESETS: Floor[] = [500, 1000, 2000];
 const WHALE_NET = 50000;
+
+// HH:MM:SS from a unix-seconds timestamp (local time, 24h).
+function fmtTime(tsSec: number): string {
+  return new Date(tsSec * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+// Human window length (minutes/hours) covered between two unix-seconds stamps.
+function fmtWindowSpan(oldestSec: number, nowSec: number): string {
+  const mins = Math.max(0, Math.round((nowSec - oldestSec) / 60));
+  if (mins < 60) return `~${mins} 分钟`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m === 0 ? `~${h} 小时` : `~${h} 小时 ${m} 分`;
+}
 
 function fmtUsd(usd: number): string {
   return usd.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -90,6 +125,7 @@ const labelStyle: React.CSSProperties = {
 
 export default function AccumulationPage() {
   const [hours, setHours] = useState<Hours>(4);
+  const [floor, setFloor] = useState<Floor>(2000);
   const [minNetUsd, setMinNetUsd] = useState<number>(10000);
   const [data, setData] = useState<AccumResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
@@ -103,6 +139,8 @@ export default function AccumulationPage() {
   // wallet(lowercased) -> ageDays|null. Filled lazily after the table renders;
   // permanently cached server-side so repeat lookups are instant.
   const [ages, setAges] = useState<Record<string, number | null>>({});
+  // Expanded detail rows, keyed by `wallet:conditionId:outcome`. Collapsed by default.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const activeReq = useRef<number>(0);
 
@@ -112,6 +150,7 @@ export default function AccumulationPage() {
     try {
       const qs = new URLSearchParams({
         hours: String(hours),
+        floor: String(floor),
         minNetUsd: String(minNetUsd),
       });
       const res = await fetch(`/api/accumulation?${qs.toString()}`, {
@@ -127,16 +166,17 @@ export default function AccumulationPage() {
     } catch (e) {
       if (reqId !== activeReq.current) return;
       setData({
-        filters: { floor: 2000, hours, minNetUsd },
+        filters: { floor, hours, minNetUsd },
         stats: { groupCount: 0, totalNetUsd: 0, topNetUsd: 0 },
         truncated: false,
+        oldestTs: null,
         groups: [],
         error: e instanceof Error ? e.message : String(e),
       });
     } finally {
       if (reqId === activeReq.current) setLoading(false);
     }
-  }, [hours, minNetUsd]);
+  }, [hours, floor, minNetUsd]);
 
   // Refetch whenever a filter changes (and on mount).
   useEffect(() => {
@@ -227,6 +267,19 @@ export default function AccumulationPage() {
   const sortArrow = (key: SortKey) =>
     sortKey === key ? (sortDir === "asc" ? " ↑" : " ↓") : "";
 
+  function rowKey(g: AccumGroup): string {
+    return `${g.wallet}:${g.conditionId}:${g.outcome}`;
+  }
+
+  function toggleExpand(key: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
   const stats = data?.stats;
 
   return (
@@ -285,6 +338,29 @@ export default function AccumulationPage() {
             gap: 8,
           }}
         >
+          <span style={labelStyle}>精度</span>
+          {FLOOR_PRESETS.map((f) => (
+            <button
+              key={f}
+              style={btnStyle(floor === f)}
+              onClick={() => setFloor(f)}
+            >
+              ${fmtUsd(f)}
+            </button>
+          ))}
+          <span style={{ fontSize: 12, color: "#6f819c" }}>
+            floor 越低越能抓到小额拆单，但时间窗越短
+          </span>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 8,
+          }}
+        >
           <span style={labelStyle}>净买入</span>
           {NET_PRESETS.map((p) => (
             <button
@@ -325,7 +401,7 @@ export default function AccumulationPage() {
         </div>
 
         <div style={{ fontSize: 12, color: "#6f819c" }}>
-          精度 floor $2000 · 每笔 &lt; $10k 才算拆单 · ≥3 笔买入
+          精度 floor ${fmtUsd(floor)} · 每笔 &lt; $10k 才算拆单 · ≥3 笔买入
         </div>
       </section>
 
@@ -370,19 +446,30 @@ export default function AccumulationPage() {
         </section>
       ) : null}
 
-      {data?.truncated ? (
+      {data && (data.truncated || data.oldestTs) ? (
         <div
           style={{
             padding: "8px 14px",
             marginBottom: 16,
-            border: "1px solid #5a4a1a",
+            border: `1px solid ${data.truncated ? "#5a4a1a" : "#26324a"}`,
             borderRadius: 8,
-            background: "#1a160c",
-            color: "#e3b341",
+            background: data.truncated ? "#1a160c" : "#0d1119",
+            color: data.truncated ? "#e3b341" : "#8aa0c0",
             fontSize: 13,
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 12,
+            alignItems: "center",
           }}
         >
-          ⚠️ 窗口可能不全（已达扫描上限）
+          {data.truncated ? <span>⚠️ 窗口可能不全（已达扫描上限）</span> : null}
+          {data.oldestTs ? (
+            <span>
+              实际覆盖{" "}
+              {fmtWindowSpan(data.oldestTs, Math.floor(Date.now() / 1000))}
+              （自 {fmtTime(data.oldestTs)} 起）
+            </span>
+          ) : null}
         </div>
       ) : null}
 
@@ -410,9 +497,12 @@ export default function AccumulationPage() {
           <table style={{ borderCollapse: "collapse", width: "100%" }}>
             <thead>
               <tr>
+                <th style={{ ...headStyle, width: 28, padding: "10px 4px" }} />
                 <th style={headStyle}>钱包</th>
                 <th style={headStyle}>地址年龄</th>
                 <th style={headStyle}>市场 · 结果</th>
+                <th style={{ ...headStyle, textAlign: "right" }}>平均赔率</th>
+                <th style={{ ...headStyle, textAlign: "right" }}>时间</th>
                 <th
                   style={{
                     ...headStyle,
@@ -467,105 +557,222 @@ export default function AccumulationPage() {
             <tbody>
               {sortedGroups.map((g, i) => {
                 const whale = g.netUsd >= WHALE_NET;
+                const key = rowKey(g);
+                const isOpen = expanded.has(key);
                 return (
-                  <tr key={`${g.wallet}-${g.conditionId}-${g.outcome}-${i}`}>
-                    <td style={cellStyle}>
-                      <a
-                        style={linkStyle}
-                        href={`https://polymarket.com/profile/${g.wallet}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        title={g.wallet}
-                      >
-                        {shortWallet(g.wallet)}
-                      </a>
-                    </td>
-                    <td style={cellStyle}>
-                      {(() => {
-                        const { text, tone } = formatAge(
-                          ages[g.wallet?.toLowerCase()],
-                        );
-                        return (
-                          <span
-                            style={{ color: ageColor[tone], fontWeight: 600 }}
-                          >
-                            {text}
-                          </span>
-                        );
-                      })()}
-                    </td>
-                    <td
-                      style={{
-                        ...cellStyle,
-                        whiteSpace: "normal",
-                        maxWidth: 360,
-                      }}
+                  <Fragment key={`${key}-${i}`}>
+                    <tr
+                      onClick={() => toggleExpand(key)}
+                      style={{ cursor: "pointer" }}
+                      title={isOpen ? "点击收起明细" : "点击展开底层买单"}
                     >
-                      {g.eventSlug ? (
+                      <td
+                        style={{
+                          ...cellStyle,
+                          padding: "10px 4px",
+                          textAlign: "center",
+                          color: "#6f819c",
+                          userSelect: "none",
+                        }}
+                      >
+                        {isOpen ? "▾" : "▸"}
+                      </td>
+                      <td style={cellStyle}>
                         <a
                           style={linkStyle}
-                          href={`https://polymarket.com/event/${g.eventSlug}`}
+                          href={`https://polymarket.com/profile/${g.wallet}`}
                           target="_blank"
                           rel="noreferrer"
+                          title={g.wallet}
+                          onClick={(e) => e.stopPropagation()}
                         >
-                          {g.title}
+                          {shortWallet(g.wallet)}
                         </a>
-                      ) : (
-                        g.title
-                      )}
-                      <div style={{ fontSize: 12, color: "#6f819c" }}>
-                        {g.outcome}
-                      </div>
-                    </td>
-                    <td
-                      style={{
-                        ...cellStyle,
-                        textAlign: "right",
-                        fontVariantNumeric: "tabular-nums",
-                        fontWeight: 700,
-                        color: "#56d18a",
-                      }}
-                    >
-                      {whale ? "🐳" : "🧩"} ${fmtUsd(g.netUsd)}
-                    </td>
-                    <td
-                      style={{
-                        ...cellStyle,
-                        textAlign: "right",
-                        fontVariantNumeric: "tabular-nums",
-                      }}
-                    >
-                      {g.buyCount} 买
-                    </td>
-                    <td
-                      style={{
-                        ...cellStyle,
-                        textAlign: "right",
-                        fontVariantNumeric: "tabular-nums",
-                      }}
-                    >
-                      ${fmtUsd(g.maxSingleBuyUsd)}
-                    </td>
-                    <td
-                      style={{
-                        ...cellStyle,
-                        textAlign: "right",
-                        fontVariantNumeric: "tabular-nums",
-                      }}
-                    >
-                      ${fmtUsd(g.buyUsd)}
-                    </td>
-                    <td
-                      style={{
-                        ...cellStyle,
-                        textAlign: "right",
-                        fontVariantNumeric: "tabular-nums",
-                        color: g.sellUsd > 0 ? "#ff8a8a" : "#6f819c",
-                      }}
-                    >
-                      ${fmtUsd(g.sellUsd)}
-                    </td>
-                  </tr>
+                      </td>
+                      <td style={cellStyle}>
+                        {(() => {
+                          const { text, tone } = formatAge(
+                            ages[g.wallet?.toLowerCase()],
+                          );
+                          return (
+                            <span
+                              style={{ color: ageColor[tone], fontWeight: 600 }}
+                            >
+                              {text}
+                            </span>
+                          );
+                        })()}
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          whiteSpace: "normal",
+                          maxWidth: 360,
+                        }}
+                      >
+                        {g.eventSlug ? (
+                          <a
+                            style={linkStyle}
+                            href={`https://polymarket.com/event/${g.eventSlug}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {g.title}
+                          </a>
+                        ) : (
+                          g.title
+                        )}
+                        <div style={{ fontSize: 12, color: "#6f819c" }}>
+                          {g.outcome}
+                        </div>
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                          fontWeight: 600,
+                          color: "#cbb46a",
+                        }}
+                        title="按 size 加权的平均买入价（赔率）"
+                      >
+                        {g.avgBuyPrice.toFixed(3)}
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                          color: "#8aa0c0",
+                        }}
+                        title={`首笔 ${fmtTime(g.firstTs)} → 末笔 ${fmtTime(
+                          g.lastTs,
+                        )}`}
+                      >
+                        {fmtTime(g.lastTs)}
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                          fontWeight: 700,
+                          color: "#56d18a",
+                        }}
+                      >
+                        {whale ? "🐳" : "🧩"} ${fmtUsd(g.netUsd)}
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        {g.buyCount} 买
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        ${fmtUsd(g.maxSingleBuyUsd)}
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        ${fmtUsd(g.buyUsd)}
+                      </td>
+                      <td
+                        style={{
+                          ...cellStyle,
+                          textAlign: "right",
+                          fontVariantNumeric: "tabular-nums",
+                          color: g.sellUsd > 0 ? "#ff8a8a" : "#6f819c",
+                        }}
+                      >
+                        ${fmtUsd(g.sellUsd)}
+                      </td>
+                    </tr>
+                    {isOpen ? (
+                      <tr>
+                        <td
+                          colSpan={11}
+                          style={{
+                            padding: "0 12px 12px 40px",
+                            borderBottom: "1px solid #1c2230",
+                            background: "#0a0d13",
+                          }}
+                        >
+                          <div
+                            style={{
+                              fontSize: 12,
+                              color: "#6f819c",
+                              margin: "8px 0 6px",
+                            }}
+                          >
+                            底层买单（共 {g.buys.length} 笔，最新在前）
+                          </div>
+                          <table
+                            style={{
+                              borderCollapse: "collapse",
+                              width: "100%",
+                              maxWidth: 440,
+                            }}
+                          >
+                            <thead>
+                              <tr>
+                                <th style={detailHead}>时间</th>
+                                <th
+                                  style={{ ...detailHead, textAlign: "right" }}
+                                >
+                                  金额
+                                </th>
+                                <th
+                                  style={{ ...detailHead, textAlign: "right" }}
+                                >
+                                  价格(赔率)
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {g.buys.map((b, bi) => (
+                                <tr key={`${key}-buy-${bi}`}>
+                                  <td style={detailCell}>{fmtTime(b.ts)}</td>
+                                  <td
+                                    style={{
+                                      ...detailCell,
+                                      textAlign: "right",
+                                      fontVariantNumeric: "tabular-nums",
+                                    }}
+                                  >
+                                    ${fmtUsd(b.usd)}
+                                  </td>
+                                  <td
+                                    style={{
+                                      ...detailCell,
+                                      textAlign: "right",
+                                      fontVariantNumeric: "tabular-nums",
+                                      color: "#cbb46a",
+                                    }}
+                                  >
+                                    {b.price.toFixed(3)}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </td>
+                      </tr>
+                    ) : null}
+                  </Fragment>
                 );
               })}
             </tbody>
@@ -575,6 +782,23 @@ export default function AccumulationPage() {
     </main>
   );
 }
+
+const detailHead: React.CSSProperties = {
+  padding: "4px 10px",
+  textAlign: "left",
+  fontSize: 11,
+  fontWeight: 600,
+  color: "#6f819c",
+  borderBottom: "1px solid #1c2230",
+  whiteSpace: "nowrap",
+};
+const detailCell: React.CSSProperties = {
+  padding: "4px 10px",
+  fontSize: 12,
+  color: "#aab6c8",
+  borderBottom: "1px solid #141923",
+  whiteSpace: "nowrap",
+};
 
 const statCard: React.CSSProperties = {
   padding: "14px 16px",
