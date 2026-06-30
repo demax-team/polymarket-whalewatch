@@ -87,6 +87,7 @@ Requirements: **Node 20+**.
 npm install
 
 # Web dashboard → http://localhost:3000
+# (set PORT in .env — or `PORT=8080 npm run dev` — to change the port)
 npm run dev
 
 # Run tests

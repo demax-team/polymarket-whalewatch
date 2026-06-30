@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "dev:webpack": "next dev --webpack",
+    "dev": "node scripts/dev-server.mjs dev",
+    "dev:webpack": "node scripts/dev-server.mjs dev --webpack",
     "build": "next build",
-    "start": "next start",
+    "start": "node scripts/dev-server.mjs start",
     "worker": "tsx worker/index.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
