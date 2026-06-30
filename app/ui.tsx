@@ -151,3 +151,30 @@ export function AgeBadge({ ageDays }: { ageDays: number | null | undefined }) {
   const { text, tone } = formatAge(ageDays);
   return <span className={AGE_CLASS[tone]}>{text}</span>;
 }
+
+/* ---------------------------------------------------------- SoundToggle */
+
+// New-record notification sound toggle. Drive it with the useSoundToggle hook
+// (state + persistence + chime-on-enable). 🔔 = on, 🔕 = off.
+export function SoundToggle({
+  on,
+  onToggle,
+}: {
+  on: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`ds-btn ${on ? "ds-btn--subtle" : "ds-btn--ghost"}`}
+      onClick={onToggle}
+      aria-pressed={on}
+      title={
+        on ? "新增记录时播放气泡提示音（点击关闭）" : "开启新增记录气泡提示音"
+      }
+      style={{ flexShrink: 0 }}
+    >
+      {on ? "🔔 提示音 开" : "🔕 提示音 关"}
+    </button>
+  );
+}

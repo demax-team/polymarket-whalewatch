@@ -1,7 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AgeBadge, Field, Segmented, SideTag, StatCard } from "./ui";
+import {
+  AgeBadge,
+  Field,
+  Segmented,
+  SideTag,
+  SoundToggle,
+  StatCard,
+} from "./ui";
+import { playBubble } from "./sound";
+import { useSoundToggle } from "./useSound";
 
 type ScanTrade = {
   title: string;
@@ -168,6 +177,34 @@ export default function Page() {
     };
   }, [data, ages]);
 
+  // --- New-trade sound notification --------------------------------------
+  // Chime when a refresh (auto/manual) brings genuinely new trades. A change of
+  // the server filters (amount/side/hours) reseeds the baseline SILENTLY — that
+  // is a new query, not a record arriving — so only same-filter refreshes ring.
+  const { soundOn, toggle } = useSoundToggle();
+  const seenTradeKeys = useRef<Set<string>>(new Set());
+  const lastFilterSig = useRef<string>("");
+
+  useEffect(() => {
+    if (!data?.trades) return;
+    const f = data.filters;
+    const sig = `${f.minUsd}|${f.side}|${f.hours}`;
+    const keys = data.trades.map((t) => t.txHash || `${t.wallet}-${t.ts}`);
+    if (sig !== lastFilterSig.current) {
+      lastFilterSig.current = sig;
+      seenTradeKeys.current = new Set(keys);
+      return;
+    }
+    let hasNew = false;
+    for (const k of keys) {
+      if (!seenTradeKeys.current.has(k)) {
+        seenTradeKeys.current.add(k);
+        hasNew = true;
+      }
+    }
+    if (hasNew && soundOn) playBubble();
+  }, [data, soundOn]);
+
   function applyCustom() {
     const n = Number(customText);
     if (Number.isFinite(n) && n > 0) {
@@ -245,17 +282,28 @@ export default function Page() {
 
   return (
     <main className="ds-main">
-      <header style={{ marginBottom: "var(--s-4)" }}>
-        <h1 style={{ fontSize: "var(--t-2xl)", marginBottom: "var(--s-1)" }}>
-          🔍 24h 大额成交扫描器
-        </h1>
-        <div className="ds-hint">
-          实时查询 Polymarket 公共 API（不落库）
-          {lastRefreshed ? ` · 最后刷新 ${lastRefreshed}` : ""}
-          {loading ? (
-            <span style={{ color: "var(--warn-700)" }}> · 加载中…</span>
-          ) : null}
+      <header
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "space-between",
+          gap: "var(--s-4)",
+          marginBottom: "var(--s-4)",
+        }}
+      >
+        <div>
+          <h1 style={{ fontSize: "var(--t-2xl)", marginBottom: "var(--s-1)" }}>
+            🔍 24h 大额成交扫描器
+          </h1>
+          <div className="ds-hint">
+            实时查询 Polymarket 公共 API（不落库）
+            {lastRefreshed ? ` · 最后刷新 ${lastRefreshed}` : ""}
+            {loading ? (
+              <span style={{ color: "var(--warn-700)" }}> · 加载中…</span>
+            ) : null}
+          </div>
         </div>
+        <SoundToggle on={soundOn} onToggle={toggle} />
       </header>
 
       {/* Controls */}

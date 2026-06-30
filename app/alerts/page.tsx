@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Field, Segmented, SideTag } from "../ui";
-import { playBubble, primeAudio } from "../sound";
+import { Field, Segmented, SideTag, SoundToggle } from "../ui";
+import { playBubble } from "../sound";
+import { useSoundToggle } from "../useSound";
 
 type AlertView = {
   title: string;
@@ -307,21 +308,11 @@ export default function Page() {
   }, []);
 
   // --- New-alert sound notification -------------------------------------
-  // Opt-in (the browser's autoplay policy needs a user gesture to start audio)
-  // and persisted across reloads. When ON, a bubble pop plays the moment a new
-  // alert record appears in the polled list.
-  const [soundOn, setSoundOn] = useState(false);
+  // Toggle state + persistence + chime-on-enable live in useSoundToggle; this
+  // page owns only the "what counts as a new record" detection below.
+  const { soundOn, toggle } = useSoundToggle();
   const seenKeys = useRef<Set<string>>(new Set());
   const primed = useRef(false);
-
-  // Restore the saved preference on mount.
-  useEffect(() => {
-    try {
-      setSoundOn(localStorage.getItem("ww_alert_sound") === "1");
-    } catch {
-      // localStorage unavailable (private mode etc.) — stay off.
-    }
-  }, []);
 
   // Detect newly-arrived alerts across polls and chime once per batch. The first
   // load seeds the baseline silently so existing history doesn't blast on open.
@@ -343,21 +334,6 @@ export default function Page() {
     }
     if (hasNew && soundOn) playBubble();
   }, [data, soundOn]);
-
-  function toggleSound() {
-    const next = !soundOn;
-    setSoundOn(next);
-    try {
-      localStorage.setItem("ww_alert_sound", next ? "1" : "0");
-    } catch {
-      // ignore persistence failure
-    }
-    // Enabling: unlock audio within this user gesture + play a confirmation chime.
-    if (next) {
-      primeAudio();
-      playBubble();
-    }
-  }
 
   return (
     <main className="ds-main">
@@ -383,20 +359,7 @@ export default function Page() {
             </span>
           </div>
         </div>
-        <button
-          type="button"
-          className={`ds-btn ${soundOn ? "ds-btn--subtle" : "ds-btn--ghost"}`}
-          onClick={toggleSound}
-          aria-pressed={soundOn}
-          title={
-            soundOn
-              ? "新增告警时播放气泡提示音（点击关闭）"
-              : "开启新增告警气泡提示音"
-          }
-          style={{ flexShrink: 0 }}
-        >
-          {soundOn ? "🔔 提示音 开" : "🔕 提示音 关"}
-        </button>
+        <SoundToggle on={soundOn} onToggle={toggle} />
       </header>
 
       <ConditionsPanel pollSeconds={4} />
