@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Field, Segmented, SideTag } from "../ui";
+import { playBubble, primeAudio } from "../sound";
 
 type AlertView = {
   title: string;
@@ -305,20 +306,97 @@ export default function Page() {
     };
   }, []);
 
+  // --- New-alert sound notification -------------------------------------
+  // Opt-in (the browser's autoplay policy needs a user gesture to start audio)
+  // and persisted across reloads. When ON, a bubble pop plays the moment a new
+  // alert record appears in the polled list.
+  const [soundOn, setSoundOn] = useState(false);
+  const seenKeys = useRef<Set<string>>(new Set());
+  const primed = useRef(false);
+
+  // Restore the saved preference on mount.
+  useEffect(() => {
+    try {
+      setSoundOn(localStorage.getItem("ww_alert_sound") === "1");
+    } catch {
+      // localStorage unavailable (private mode etc.) — stay off.
+    }
+  }, []);
+
+  // Detect newly-arrived alerts across polls and chime once per batch. The first
+  // load seeds the baseline silently so existing history doesn't blast on open.
+  useEffect(() => {
+    const keys = data.alerts.map(
+      (a) => a.txHash || `${a.wallet}-${a.createdAt}`,
+    );
+    if (!primed.current) {
+      seenKeys.current = new Set(keys);
+      primed.current = true;
+      return;
+    }
+    let hasNew = false;
+    for (const k of keys) {
+      if (!seenKeys.current.has(k)) {
+        seenKeys.current.add(k);
+        hasNew = true;
+      }
+    }
+    if (hasNew && soundOn) playBubble();
+  }, [data, soundOn]);
+
+  function toggleSound() {
+    const next = !soundOn;
+    setSoundOn(next);
+    try {
+      localStorage.setItem("ww_alert_sound", next ? "1" : "0");
+    } catch {
+      // ignore persistence failure
+    }
+    // Enabling: unlock audio within this user gesture + play a confirmation chime.
+    if (next) {
+      primeAudio();
+      playBubble();
+    }
+  }
+
   return (
     <main className="ds-main">
-      <header style={{ marginBottom: "var(--s-5)" }}>
-        <h1 style={{ fontSize: "var(--t-2xl)", marginBottom: "var(--s-1)" }}>
-          🐋 Polymarket 大额成交监控
-        </h1>
-        <div className="ds-hint">
-          共 <span className="mono">{data.count}</span> 条告警
-          {lastRefreshed ? ` · 最后刷新 ${lastRefreshed}` : ""}
-          {error ? <span className="down"> · 刷新失败: {error}</span> : null}
-          <span className="muted" style={{ marginLeft: "var(--s-2)" }}>
-            · 每 5 秒自动刷新
-          </span>
+      <header
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "space-between",
+          gap: "var(--s-4)",
+          marginBottom: "var(--s-5)",
+        }}
+      >
+        <div>
+          <h1 style={{ fontSize: "var(--t-2xl)", marginBottom: "var(--s-1)" }}>
+            🐋 Polymarket 大额成交监控
+          </h1>
+          <div className="ds-hint">
+            共 <span className="mono">{data.count}</span> 条告警
+            {lastRefreshed ? ` · 最后刷新 ${lastRefreshed}` : ""}
+            {error ? <span className="down"> · 刷新失败: {error}</span> : null}
+            <span className="muted" style={{ marginLeft: "var(--s-2)" }}>
+              · 每 5 秒自动刷新
+            </span>
+          </div>
         </div>
+        <button
+          type="button"
+          className={`ds-btn ${soundOn ? "ds-btn--subtle" : "ds-btn--ghost"}`}
+          onClick={toggleSound}
+          aria-pressed={soundOn}
+          title={
+            soundOn
+              ? "新增告警时播放气泡提示音（点击关闭）"
+              : "开启新增告警气泡提示音"
+          }
+          style={{ flexShrink: 0 }}
+        >
+          {soundOn ? "🔔 提示音 开" : "🔕 提示音 关"}
+        </button>
       </header>
 
       <ConditionsPanel pollSeconds={4} />
