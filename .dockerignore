@@ -1,0 +1,23 @@
+# node_modules holds the macOS-compiled better-sqlite3 binary — never ship it
+# into the Linux image; the builder reinstalls from package-lock.json.
+node_modules
+.next
+.git
+
+# Local SQLite data + WAL/SHM sidecars stay out of the image (use a volume).
+*.sqlite*
+*.db
+
+# Local-only config and secrets (pass env via docker-compose instead).
+.env
+.env.local
+
+# Tooling / session artifacts that don't belong in the build context.
+.claude
+.playwright-mcp
+docs
+*.tsbuildinfo
+next-env.d.ts
+__pycache__
+*.pyc
+*.py
