@@ -46,6 +46,6 @@ ENV DASH_DB=/app/data/data.sqlite
 USER node
 EXPOSE 3000
 
-# `npm run start` -> scripts/next.mjs start: loads .env if present, then spawns
+# `npm run start` -> scripts/dev-server.mjs start: loads .env if present, then spawns
 # `next start` inheriting PORT/DASH_DB from the container env.
 CMD ["npm", "run", "start"]
