@@ -6,6 +6,7 @@ import {
   CopyButton,
   Field,
   Icon,
+  QuietLink,
   Segmented,
   SideTag,
   SoundToggle,
@@ -51,6 +52,10 @@ type Side = "ALL" | "BUY" | "SELL";
 type Hours = 1 | 6 | 24;
 
 const AMOUNT_PRESETS = [10000, 50000, 100000];
+
+// External trade page for a market slug (wired.fund tooling).
+const TRADE_LINK_BASE =
+  "https://onchain-dev.wired.fund/polymarket/trade-slug?slug=";
 // Sentinel for the "全部" (no cap) option in the address-age segmented control,
 // since the control's value type can't be null.
 const AGE_ALL = -1;
@@ -674,6 +679,14 @@ export default function Page() {
                           text={t.slug || t.eventSlug}
                           label="复制 market slug"
                         />
+                        {t.slug || t.eventSlug ? (
+                          <QuietLink
+                            href={`${TRADE_LINK_BASE}${encodeURIComponent(t.slug || t.eventSlug)}`}
+                            title={`在 wired.fund 打开交易页：${t.slug || t.eventSlug}`}
+                          >
+                            ↗
+                          </QuietLink>
+                        ) : null}
                       </div>
                     </td>
                     <td>

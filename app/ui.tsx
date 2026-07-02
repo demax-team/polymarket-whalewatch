@@ -148,6 +148,35 @@ export function CopyButton({
   );
 }
 
+/* ------------------------------------------------------------ QuietLink */
+
+// External jump in the same barely-there style as CopyButton (shares its
+// .copy-btn look: faint glyph, row-hover reveal). Click never bubbles.
+export function QuietLink({
+  href,
+  title,
+  children,
+}: {
+  href: string;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <a
+      className="copy-btn"
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title={title}
+      aria-label={title}
+      onClick={(e) => e.stopPropagation()}
+      style={{ textDecoration: "none" }}
+    >
+      {children}
+    </a>
+  );
+}
+
 /* ------------------------------------------------------------- Category */
 
 // Chinese display names for the gamma tag taxonomy; unknown labels pass

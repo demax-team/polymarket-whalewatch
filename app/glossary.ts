@@ -83,9 +83,10 @@ export const ICONS: IconEntry[] = [
   },
   {
     symbol: "↗",
-    name: "链上记录",
-    tip: "跳转 Polygonscan 查看该笔成交的链上交易",
-    detail: "跳转 Polygonscan 查看该笔成交对应的链上交易哈希。",
+    name: "外部跳转",
+    tip: "外部跳转：tx 列跳 Polygonscan；slug 旁跳 wired.fund 交易页",
+    detail:
+      "外部跳转链接：tx 列的 ↗ 跳转 Polygonscan 查看该笔成交的链上交易哈希；市场副标题行 ⧉ 旁的 ↗ 用 market slug 跳转 wired.fund 的交易页（onchain-dev.wired.fund/polymarket/trade-slug）。悬停可见完整目标。",
   },
   {
     symbol: "⧉",
