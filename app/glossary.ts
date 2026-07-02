@@ -83,9 +83,17 @@ export const ICONS: IconEntry[] = [
   },
   {
     symbol: "↗",
-    name: "链上记录",
-    tip: "跳转 Polygonscan 查看该笔成交的链上交易",
-    detail: "跳转 Polygonscan 查看该笔成交对应的链上交易哈希。",
+    name: "外部跳转",
+    tip: "外部跳转：tx 列跳 Polygonscan；slug 旁跳 wired.fund 交易页",
+    detail:
+      "外部跳转链接：tx 列的 ↗ 跳转 Polygonscan 查看该笔成交的链上交易哈希；市场副标题行 ⧉ 旁的 ↗ 用 market slug 跳转 wired.fund 的交易页（onchain-dev.wired.fund/polymarket/trade-slug）。悬停可见完整目标。",
+  },
+  {
+    symbol: "⧉",
+    name: "复制 market slug",
+    tip: "复制该盘口的 market slug 到剪贴板",
+    detail:
+      "把该盘口（单个 market）的 slug 复制到剪贴板，如 strait-of-hormuz-traffic-returns-to-normal-by-end-of-june —— 即 gamma /markets?slug= 的查询键，精确定位这一个盘口。注意与事件 slug 的区别：多盘口事件下每个盘口有自己的 market slug（如 …-2026-07-02-che），事件 slug 则指向整个比赛页。复制成功会短暂显示 ✓。",
   },
   {
     symbol: "…",
@@ -105,7 +113,7 @@ export const TERMS: TermEntry[] = [
   {
     term: "战绩",
     detail:
-      "钱包在已结算市场上的历史表现：胜率（盈利仓位占比）· 已实现盈亏（USD）。悬停可见已结算市场数与 ROI。来自 /closed-positions 的全量已结算仓位，缓存 24 小时。",
+      "钱包在已结算市场上的历史表现：胜率（盈利仓位占比）· 已实现盈亏（USD）。悬停可见已结算市场数与 ROI。统计合并两个来源：已平仓/已赎回仓位（/closed-positions），以及已判定但从未平仓的仓位——尤其是持有到归零的亏损单（输光的仓位没有东西可赎回，链上不会产生任何结算记录，只统计前者会把胜率虚推到 100%）。缓存 24 小时。",
   },
   {
     term: "ROI",
@@ -161,6 +169,11 @@ export const TERMS: TermEntry[] = [
     term: "内幕猎杀组合",
     detail:
       "价格 0.5–0.9 + 地址年龄 ≤7 天的筛选组合（可再叠加距结算 ≤N 小时）：异常内幕资金倾向于用新钱包、在有利赔率、临近结算时买入——三个条件叠加能把成交洪流收敛成一张嫌疑名单。",
+  },
+  {
+    term: "类型（市场类别）",
+    detail:
+      "来自 Polymarket 事件标签的市场大类（体育/政治/加密/经济等），扫描器可按类型筛选。标签取事件 tags 中的主类别标签；没有可识别标签的归入'其他'。",
   },
   {
     term: "颜色语义",
