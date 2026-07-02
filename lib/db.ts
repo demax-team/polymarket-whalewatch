@@ -40,6 +40,22 @@ export function openDb(path = "data.sqlite") {
       "INSERT OR REPLACE INTO config (key, value) VALUES ('wallet_age_v', '2')",
     ).run();
   }
+  // wallet_stats v2: earlier stats were survivorship-biased — positions held
+  // to ZERO never enter /closed-positions (nothing to redeem), so pure-closed
+  // win rates read 100% for wallets that ride losers into the ground. v2 also
+  // counts resolved-but-unclosed positions from /positions. Purge the biased
+  // cache and clear the seed-day marker so the smart-wallet whitelist re-scores
+  // with honest win rates on the engine's next cycle.
+  const statsVer = db
+    .prepare("SELECT value FROM config WHERE key = 'wallet_stats_v'")
+    .get() as { value: string | null } | undefined;
+  if (statsVer?.value !== "2") {
+    db.prepare("DELETE FROM wallet_stats").run();
+    db.prepare("DELETE FROM config WHERE key = 'smart_seed_last_day'").run();
+    db.prepare(
+      "INSERT OR REPLACE INTO config (key, value) VALUES ('wallet_stats_v', '2')",
+    ).run();
+  }
   return db;
 }
 export type DB = ReturnType<typeof openDb>;
