@@ -8,9 +8,11 @@ import {
   SideTag,
   SoundToggle,
   StatCard,
+  WalletStatsBadge,
 } from "./ui";
 import { playBubble } from "./sound";
 import { useSoundToggle } from "./useSound";
+import { useWalletIntel } from "./useWalletIntel";
 
 type ScanTrade = {
   title: string;
@@ -260,6 +262,12 @@ export default function Page() {
       return !w || !(w in ages);
     });
   }, [sortedTrades, minPrice, maxPrice, maxAgeDays, ages]);
+
+  // Settled-market track record + smart-wallet flags, enriched lazily for the
+  // rows that survive the client-side filters (the narrowed view fills first).
+  const { stats: walletStats, smart } = useWalletIntel(
+    displayedTrades.map((t) => t.wallet),
+  );
 
   function toggleSort(key: "time" | "amount") {
     if (sortKey === key) {
@@ -593,6 +601,9 @@ export default function Page() {
                 <th className="is-right">价格</th>
                 <th>钱包</th>
                 <th>地址年龄</th>
+                <th title="已结算市场胜率 · 已实现盈亏（🏆 = 聪明钱白名单）">
+                  战绩
+                </th>
                 <th>tx</th>
               </tr>
             </thead>
@@ -636,6 +647,12 @@ export default function Page() {
                     </td>
                     <td>
                       <AgeBadge ageDays={ages[t.wallet?.toLowerCase()]} />
+                    </td>
+                    <td>
+                      <WalletStatsBadge
+                        stats={walletStats[t.wallet?.toLowerCase()]}
+                        smart={smart[t.wallet?.toLowerCase()]}
+                      />
                     </td>
                     <td>
                       {t.txHash ? (

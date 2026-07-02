@@ -152,6 +152,82 @@ export function AgeBadge({ ageDays }: { ageDays: number | null | undefined }) {
   return <span className={AGE_CLASS[tone]}>{text}</span>;
 }
 
+/* ------------------------------------------------------ WalletStatsBadge */
+
+// Client-safe mirror of lib/walletStats.WalletStats (type-only; the lib module
+// itself imports better-sqlite3 and must stay server-only).
+export type WalletStatsLite = {
+  winRate: number | null;
+  realizedPnl: number;
+  roi: number | null;
+  settledCount: number;
+  truncated: boolean;
+};
+
+export type SmartInfoLite = { score: number | null; isWhitelist: boolean };
+
+// Compact signed USD: +$38k / −$1.2m. Sub-$1k amounts round to whole dollars.
+export function fmtSignedUsdCompact(n: number): string {
+  const sign = n < 0 ? "−" : "+";
+  const abs = Math.abs(n);
+  const num =
+    abs >= 1_000_000
+      ? `${(abs / 1_000_000).toFixed(1)}m`
+      : abs >= 1_000
+        ? `${(abs / 1_000).toFixed(abs >= 10_000 ? 0 : 1)}k`
+        : `${Math.round(abs)}`;
+  return `${sign}$${num}`;
+}
+
+// Settled-market track record for a wallet row: "72% · +$38k", green when the
+// wallet is net-profitable, red when net-losing. `undefined` = still loading,
+// `null` = lookup failed, settledCount 0 = no settled history yet.
+export function WalletStatsBadge({
+  stats,
+  smart,
+}: {
+  stats: WalletStatsLite | null | undefined;
+  smart?: SmartInfoLite | null;
+}) {
+  const trophy = smart ? (
+    <span
+      className="ds-tag ds-tag--brand"
+      title={`聪明钱白名单${smart.score != null ? ` · 评分 ${Math.round(smart.score)}` : ""}`}
+    >
+      🏆
+    </span>
+  ) : null;
+  if (stats === undefined) {
+    return (
+      <span className="mono muted">
+        {trophy}
+        {trophy ? " " : ""}…
+      </span>
+    );
+  }
+  if (stats === null || stats.settledCount === 0) {
+    return (
+      <span className="mono muted" title="无已结算战绩">
+        {trophy}
+        {trophy ? " " : ""}—
+      </span>
+    );
+  }
+  const pct = Math.round((stats.winRate ?? 0) * 100);
+  const tone = stats.realizedPnl >= 0 ? "up" : "down";
+  const title =
+    `已结算 ${stats.settledCount}${stats.truncated ? "+" : ""} 市场 · 胜率 ${pct}%` +
+    (stats.roi != null ? ` · ROI ${(stats.roi * 100).toFixed(1)}%` : "");
+  return (
+    <span className="mono" title={title} style={{ whiteSpace: "nowrap" }}>
+      {trophy}
+      {trophy ? " " : ""}
+      {pct}% ·{" "}
+      <span className={tone}>{fmtSignedUsdCompact(stats.realizedPnl)}</span>
+    </span>
+  );
+}
+
 /* ---------------------------------------------------------- SoundToggle */
 
 // New-record notification sound toggle. Drive it with the useSoundToggle hook
