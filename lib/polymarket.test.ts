@@ -159,6 +159,62 @@ it("getTradesWindow returns truncated:true when it hits the page cap with all ro
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
+it("getTradesWindow stops BEFORE the verified 3000 offset cap and reports truncated", async () => {
+  const sinceSec = 1700000000;
+  const fullPage = Array.from({ length: 500 }, (_, i) =>
+    trade({ timestamp: sinceSec + 1000, transactionHash: `0x${i}` }),
+  );
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValue({ ok: true, json: async () => fullPage });
+  vi.stubGlobal("fetch", fetchMock);
+  const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const { trades, truncated } = await getTradesWindow({
+    minUsd: 2000,
+    sinceSec,
+    maxPages: 20,
+  });
+  expect(truncated).toBe(true);
+  // offsets 0..3000 are legal (7 pages); offset 3500 must never be requested.
+  expect(fetchMock).toHaveBeenCalledTimes(7);
+  expect(trades).toHaveLength(3500);
+  const urls = fetchMock.mock.calls.map((c) => c[0] as string);
+  expect(urls.some((u) => u.includes("offset=3500"))).toBe(false);
+  warnSpy.mockRestore();
+});
+
+it("getTradesWindow degrades a mid-pagination 400 (moved offset cap) to a truncated window", async () => {
+  const sinceSec = 1700000000;
+  const fullPage = Array.from({ length: 500 }, (_, i) =>
+    trade({ timestamp: sinceSec + 1000, transactionHash: `0x${i}` }),
+  );
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => fullPage })
+    .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({}) });
+  vi.stubGlobal("fetch", fetchMock);
+  const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const { trades, truncated } = await getTradesWindow({
+    minUsd: 2000,
+    sinceSec,
+  });
+  expect(truncated).toBe(true);
+  expect(trades).toHaveLength(500); // the fetched prefix survives
+  warnSpy.mockRestore();
+});
+
+it("getTradesWindow still throws on a FIRST-page 400 (genuinely bad request)", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValue({ ok: false, status: 400, json: async () => ({}) }),
+  );
+  await expect(
+    getTradesWindow({ minUsd: 2000, sinceSec: 1700000000 }),
+  ).rejects.toThrow("400");
+});
+
 it("getTradesWindow retries a transient 408 then succeeds", async () => {
   const sinceSec = 1700000000;
   const page = [

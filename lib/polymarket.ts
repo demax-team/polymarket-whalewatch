@@ -70,12 +70,20 @@ export interface TradesWindowQuery {
   maxPages?: number;
 }
 
+// Verified live: /trades offset hard-caps at 3000 — deeper requests fail with
+// HTTP 400 "max historical activity offset of 3000 exceeded" (same cap as
+// /activity). Dense windows (low floor × long window) DO reach it, so the
+// pagination below treats the cap as "window truncated", never as a failure.
+const MAX_TRADES_OFFSET = 3000;
+
 /**
  * Fetch all large trades newer than `sinceSec`, paginating by offset because the
  * Data API has no time-range param. Rows come back newest-first, so we stop as
  * soon as we see a row older than the cutoff (window edge reached → complete).
- * `truncated:true` means we hit `maxPages` before reaching the edge, so older
- * in-window trades may still exist and are NOT included.
+ * `truncated:true` means we hit `maxPages` OR the API's hard offset cap before
+ * reaching the edge, so older in-window trades may still exist and are NOT
+ * included — the fetched prefix is still a complete, self-consistent
+ * (shorter) window.
  */
 export async function getTradesWindow({
   minUsd,
@@ -85,10 +93,28 @@ export async function getTradesWindow({
 }: TradesWindowQuery): Promise<{ trades: Trade[]; truncated: boolean }> {
   const out: Trade[] = [];
   for (let page = 0; page < maxPages; page++) {
+    const offset = page * 500;
+    if (offset > MAX_TRADES_OFFSET) {
+      console.warn(
+        `[getTradesWindow] offset cap ${MAX_TRADES_OFFSET} reached (${out.length} rows) — window truncated`,
+      );
+      return { trades: out, truncated: true };
+    }
     const sideParam = side ? `&side=${side}` : "";
-    const url = `${DATA_API}/trades?filterType=CASH&filterAmount=${minUsd}&takerOnly=true&limit=500&offset=${page * 500}${sideParam}`;
+    const url = `${DATA_API}/trades?filterType=CASH&filterAmount=${minUsd}&takerOnly=true&limit=500&offset=${offset}${sideParam}`;
     const res = await fetchTrades(url);
-    if (!res.ok) throw new Error(`getTradesWindow ${res.status}`);
+    if (!res.ok) {
+      // A mid-pagination 400 is the deep-offset cap (possibly moved server-side):
+      // degrade to the fetched prefix instead of failing the whole scan. A 400
+      // on the FIRST page is a genuinely bad request and still throws.
+      if (res.status === 400 && page > 0) {
+        console.warn(
+          `[getTradesWindow] offset rejected at page ${page} (${out.length} rows) — window truncated`,
+        );
+        return { trades: out, truncated: true };
+      }
+      throw new Error(`getTradesWindow ${res.status}`);
+    }
     const raw = await res.json();
     const parsed = z.array(TradeSchema).safeParse(raw);
     const rows: Trade[] = parsed.success ? parsed.data : (raw as Trade[]);

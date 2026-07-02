@@ -248,6 +248,12 @@ export default function ConsensusPage() {
                   g.currentPrice != null
                     ? g.currentPrice - g.avgBuyPrice
                     : null;
+                // A price pinned at 0/1 means the event is decided even when
+                // gamma's `closed` flag lags — either way "following" is moot.
+                const settled =
+                  g.closed ||
+                  (g.currentPrice != null &&
+                    (g.currentPrice >= 0.999 || g.currentPrice <= 0.001));
                 return (
                   <Fragment key={key}>
                     <tr
@@ -307,7 +313,7 @@ export default function ConsensusPage() {
                       <td>
                         {gap == null ? (
                           <span className="muted">—</span>
-                        ) : g.closed ? (
+                        ) : settled ? (
                           // Settled market: following is moot — show whether
                           // the smart-money consensus was RIGHT instead.
                           g.currentPrice != null && g.currentPrice > 0.5 ? (
