@@ -66,6 +66,12 @@ function validate(body: unknown): AlertConditions {
     minPrice: clampPrice(b.minPrice),
     maxPrice: clampPrice(b.maxPrice),
     maxAgeDays: clampAge(b.maxAgeDays),
+    smartOnly:
+      typeof b.smartOnly === "boolean"
+        ? b.smartOnly
+        : DEFAULT_CONDITIONS.smartOnly,
+    // Same non-negative-or-null semantics as the age cap.
+    maxHoursToEnd: clampAge(b.maxHoursToEnd),
   };
 }
 

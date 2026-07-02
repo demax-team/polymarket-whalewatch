@@ -4,13 +4,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AgeBadge,
   Field,
+  Icon,
   Segmented,
   SideTag,
   SoundToggle,
   StatCard,
+  WalletStatsBadge,
 } from "./ui";
 import { playBubble } from "./sound";
 import { useSoundToggle } from "./useSound";
+import { useWalletIntel } from "./useWalletIntel";
 
 type ScanTrade = {
   title: string;
@@ -260,6 +263,12 @@ export default function Page() {
       return !w || !(w in ages);
     });
   }, [sortedTrades, minPrice, maxPrice, maxAgeDays, ages]);
+
+  // Settled-market track record + smart-wallet flags, enriched lazily for the
+  // rows that survive the client-side filters (the narrowed view fills first).
+  const { stats: walletStats, smart } = useWalletIntel(
+    displayedTrades.map((t) => t.wallet),
+  );
 
   function toggleSort(key: "time" | "amount") {
     if (sortKey === key) {
@@ -548,7 +557,7 @@ export default function Page() {
           className="ds-callout ds-callout--warn"
           style={{ marginBottom: "var(--s-4)" }}
         >
-          ⚠️ 结果可能不全（已达扫描上限）
+          ⏱️ 成交太密集，API 回看深度已用满 — 时间窗尾部的部分成交未覆盖
         </div>
       ) : null}
 
@@ -593,6 +602,9 @@ export default function Page() {
                 <th className="is-right">价格</th>
                 <th>钱包</th>
                 <th>地址年龄</th>
+                <th title="已结算市场胜率 · 已实现盈亏（🏆 = 聪明钱白名单）">
+                  战绩
+                </th>
                 <th>tx</th>
               </tr>
             </thead>
@@ -620,22 +632,26 @@ export default function Page() {
                       <SideTag side={t.side} />
                     </td>
                     <td className="mono is-right">
-                      {whale ? "🐳" : "💰"} ${fmtUsd(t.usd)}
+                      <Icon s={whale ? "🐳" : "💰"} /> ${fmtUsd(t.usd)}
                     </td>
                     <td className="mono is-right">{t.price.toFixed(3)}</td>
                     <td>
                       <a
                         className="mono"
-                        href={`https://polymarket.com/profile/${t.wallet}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        title={t.wallet}
+                        href={`/wallet/${t.wallet?.toLowerCase()}`}
+                        title={`${t.wallet} · 点击查看钱包档案`}
                       >
                         {shortWallet(t.wallet)}
                       </a>
                     </td>
                     <td>
                       <AgeBadge ageDays={ages[t.wallet?.toLowerCase()]} />
+                    </td>
+                    <td>
+                      <WalletStatsBadge
+                        stats={walletStats[t.wallet?.toLowerCase()]}
+                        smart={smart[t.wallet?.toLowerCase()]}
+                      />
                     </td>
                     <td>
                       {t.txHash ? (

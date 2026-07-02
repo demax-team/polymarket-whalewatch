@@ -193,6 +193,161 @@ describe("runAlertCycle", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it("(i) smart-wallet trades get the 🏆 tag and type='smart'", async () => {
+    const db = openDb(":memory:");
+    const smartTrade = mk({ transactionHash: "0xs", proxyWallet: "0xSMART" });
+    const plainTrade = mk({ transactionHash: "0xp", proxyWallet: "0xPLAIN" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const getSmart = vi.fn((_wallets: string[]) => ({
+      "0xsmart": { score: 82 },
+    }));
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [smartTrade, plainTrade],
+      conditions: cond({ minUsd: 10000 }),
+      getAges: noAges,
+      getSmart,
+      send,
+      minTimestamp: 0,
+    });
+
+    expect(fired).toBe(2);
+    const sent = send.mock.calls.map((c) => c[0] as string);
+    expect(sent.some((m) => m.includes("🏆 聪明钱(82)"))).toBe(true);
+    const types = db
+      .prepare("SELECT type, dedup_key FROM alerts ORDER BY id")
+      .all() as { type: string; dedup_key: string }[];
+    expect(new Set(types.map((r) => r.type))).toEqual(
+      new Set(["smart", "large"]),
+    );
+    expect(types.find((r) => r.dedup_key === dedupKey(smartTrade))?.type).toBe(
+      "smart",
+    );
+  });
+
+  it("(j) smartOnly keeps only smart-wallet trades (and matches nothing without getSmart)", async () => {
+    const db = openDb(":memory:");
+    const smartTrade = mk({ transactionHash: "0xs", proxyWallet: "0xSMART" });
+    const plainTrade = mk({ transactionHash: "0xp", proxyWallet: "0xPLAIN" });
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [smartTrade, plainTrade],
+      conditions: cond({ minUsd: 10000, smartOnly: true }),
+      getAges: noAges,
+      getSmart: () => ({ "0xsmart": { score: null } }),
+      send,
+      minTimestamp: 0,
+    });
+    expect(fired).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0] as string).toContain("🏆 聪明钱");
+
+    // Without a getSmart dep there is no whitelist — smartOnly matches nothing.
+    const db2 = openDb(":memory:");
+    const fired2 = await runAlertCycle({
+      db: db2,
+      fetchTrades: async () => [mk()],
+      conditions: cond({ minUsd: 10000, smartOnly: true }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+    });
+    expect(fired2).toBe(0);
+  });
+
+  it("(k) maxHoursToEnd keeps only pre-settlement trades and enriches the alert", async () => {
+    const db = openDb(":memory:");
+    const NOW = Math.floor(Date.parse("2026-07-01T00:00:00Z") / 1000);
+    const soon = mk({ transactionHash: "0xsoon", conditionId: "0xsoon" });
+    const far = mk({ transactionHash: "0xfar", conditionId: "0xfar" });
+    const unknown = mk({ transactionHash: "0xunk", conditionId: "0xunk" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const metaFor = (cid: string, endDate: string) => ({
+      conditionId: cid,
+      volume24hr: 100_000,
+      liquidity: 50_000,
+      endDate,
+      closed: false,
+      category: null,
+      outcomes: ["Yes", "No"],
+      outcomePrices: [0.5, 0.5],
+    });
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [soon, far, unknown],
+      conditions: cond({ minUsd: 10000, maxHoursToEnd: 6 }),
+      getAges: noAges,
+      getMarketMeta: async () => ({
+        "0xsoon": metaFor("0xsoon", "2026-07-01T05:00:00Z"), // 5h out
+        "0xfar": metaFor("0xfar", "2026-07-05T00:00:00Z"), // 96h out
+        // 0xunk missing → dropped
+      }),
+      send,
+      minTimestamp: 0,
+      nowSec: NOW,
+    });
+
+    expect(fired).toBe(1);
+    const msg = send.mock.calls[0][0] as string;
+    expect(msg).toContain("距结算 5h");
+    expect(msg).toContain("占24h量 50%"); // $50k trade / $100k 24h volume
+    // The recorded payload carries the market context for later analysis.
+    const row = db.prepare("SELECT payload FROM alerts").get() as {
+      payload: string;
+    };
+    const payload = JSON.parse(row.payload);
+    expect(payload.marketCtx.hoursToEnd).toBeCloseTo(5);
+  });
+
+  it("(l) missing meta under maxHoursToEnd defers the trade to the next cycle instead of swallowing it", async () => {
+    const db = openDb(":memory:");
+    const NOW = Math.floor(Date.parse("2026-07-01T00:00:00Z") / 1000);
+    const t = mk({ transactionHash: "0xdefer", conditionId: "0xdefer" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const metaFor = {
+      conditionId: "0xdefer",
+      volume24hr: 100_000,
+      liquidity: 50_000,
+      endDate: "2026-07-01T05:00:00Z",
+      closed: false,
+      category: null,
+      outcomes: ["Yes", "No"],
+      outcomePrices: [0.5, 0.5],
+    };
+    const base = {
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000, maxHoursToEnd: 6 }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+      nowSec: NOW,
+    };
+
+    // Cycle 1: gamma is down → meta missing → no fire, and NOT marked seen.
+    expect(
+      await runAlertCycle({ ...base, getMarketMeta: async () => ({}) }),
+    ).toBe(0);
+    expect(
+      db.prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?").get(
+        dedupKey(t),
+      ),
+    ).toBeUndefined();
+
+    // Cycle 2: gamma recovered → the same trade fires normally.
+    expect(
+      await runAlertCycle({
+        ...base,
+        getMarketMeta: async () => ({ "0xdefer": metaFor }),
+      }),
+    ).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("(h) Telegram-less (send undefined) still records to alerts", async () => {
     const db = openDb(":memory:");
     const t = mk();

@@ -8,7 +8,15 @@ import {
   useRef,
   useState,
 } from "react";
-import { AgeBadge, Field, Segmented, StatCard } from "../ui";
+import {
+  AgeBadge,
+  Field,
+  Icon,
+  Segmented,
+  StatCard,
+  WalletStatsBadge,
+} from "../ui";
+import { useWalletIntel } from "../useWalletIntel";
 
 type AccumBuy = {
   ts: number;
@@ -213,6 +221,11 @@ export default function AccumulationPage() {
     return arr;
   }, [data, sortKey, sortDir]);
 
+  // Settled-market track record + smart-wallet flags for the ranked wallets.
+  const { stats: walletStats, smart } = useWalletIntel(
+    sortedGroups.map((g) => g.wallet),
+  );
+
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
       setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -368,7 +381,9 @@ export default function AccumulationPage() {
             alignItems: "center",
           }}
         >
-          {data.truncated ? <span>⚠️ 窗口可能不全（已达扫描上限）</span> : null}
+          {data.truncated ? (
+            <span>⏱️ 成交太密集，API 回看深度已用满 — 以下为完整覆盖时段</span>
+          ) : null}
           {data.oldestTs ? (
             <span>
               实际覆盖{" "}
@@ -390,6 +405,9 @@ export default function AccumulationPage() {
                 <th style={{ width: 28, padding: "var(--s-2) var(--s-1)" }} />
                 <th>钱包</th>
                 <th>地址年龄</th>
+                <th title="已结算市场胜率 · 已实现盈亏（🏆 = 聪明钱白名单）">
+                  战绩
+                </th>
                 <th>市场 · 结果</th>
                 <th className="is-right">平均赔率</th>
                 <th className="is-right">时间</th>
@@ -449,10 +467,8 @@ export default function AccumulationPage() {
                       <td>
                         <a
                           className="mono"
-                          href={`https://polymarket.com/profile/${g.wallet}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          title={g.wallet}
+                          href={`/wallet/${g.wallet?.toLowerCase()}`}
+                          title={`${g.wallet} · 点击查看钱包档案`}
                           onClick={(e) => e.stopPropagation()}
                         >
                           {shortWallet(g.wallet)}
@@ -460,6 +476,12 @@ export default function AccumulationPage() {
                       </td>
                       <td>
                         <AgeBadge ageDays={ages[g.wallet?.toLowerCase()]} />
+                      </td>
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <WalletStatsBadge
+                          stats={walletStats[g.wallet?.toLowerCase()]}
+                          smart={smart[g.wallet?.toLowerCase()]}
+                        />
                       </td>
                       <td style={{ whiteSpace: "normal", maxWidth: 360 }}>
                         {g.eventSlug ? (
@@ -493,7 +515,7 @@ export default function AccumulationPage() {
                       </td>
                       <td className="mono is-right">
                         <span className="up" style={{ fontWeight: 700 }}>
-                          {whale ? "🐳" : "🧩"} ${fmtUsd(g.netUsd)}
+                          <Icon s={whale ? "🐳" : "🧩"} /> ${fmtUsd(g.netUsd)}
                         </span>
                       </td>
                       <td className="mono is-right">{g.buyCount} 买</td>
@@ -514,7 +536,7 @@ export default function AccumulationPage() {
                     {isOpen ? (
                       <tr>
                         <td
-                          colSpan={11}
+                          colSpan={12}
                           style={{
                             padding: "0 var(--s-3) var(--s-3) var(--s-10)",
                             borderBottom: "1px solid var(--n-150)",

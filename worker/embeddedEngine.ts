@@ -1,14 +1,24 @@
 import { parseConfig } from "../lib/config";
 import { openDb, type DB } from "../lib/db";
-import { getLargeTrades } from "../lib/polymarket";
+import { getLargeTrades, getTradesWindowDeep } from "../lib/polymarket";
 import { sendMessage } from "../lib/telegram";
 import { getWalletAges } from "../lib/walletAge";
 import { getAlertConditions } from "../lib/alertConditions";
 import { runAlertCycle } from "../lib/alertEngine";
+import {
+  getAllSmartTags,
+  getSmartTags,
+  maybeDailySeed,
+} from "../lib/smartWallets";
+import { getMarketMeta } from "../lib/gamma";
+import { runConsensusCycle } from "../lib/consensus";
 
-// Guarded singleton: instrumentation may call this more than once (per runtime),
-// and `npm run worker` also calls it — the flag makes every call after the first
-// a no-op so we never run two concurrent poll loops against the same db.
+// Guarded singleton PER PROCESS: instrumentation may call this more than once
+// within a runtime, and the flag makes repeat calls no-ops. It does NOT guard
+// across processes — running the Next app AND `npm run worker` concurrently
+// gives two engines on the same db. Alert rows stay deduped either way (unique
+// (type, dedup_key) index + INSERT OR IGNORE), but Telegram pushes may rarely
+// double up in that setup; prefer running one or the other.
 let started = false;
 
 const SECONDS_PER_DAY = 86400;
@@ -77,12 +87,25 @@ export function startAlertEngine(): void {
 
   async function loop() {
     try {
+      // Daily (UTC) smart-wallet seeding from the official leaderboards. Fire
+      // and forget: seeding can take a while (per-wallet /closed-positions
+      // enrichment) and must never delay the 4s alert cycle.
+      maybeDailySeed(db)
+        ?.then((r) =>
+          console.log(
+            `[engine] smart-wallet seed: ${r.seeded} wallets (${r.enriched} enriched)`,
+          ),
+        )
+        .catch((e) => console.error("[engine] smart-wallet seed failed", e));
+
       const conditions = getAlertConditions(db);
       const fired = await runAlertCycle({
         db,
         fetchTrades: () => fetchTrades(conditions.minUsd),
         conditions,
         getAges,
+        getSmart: (wallets) => getSmartTags(db, wallets),
+        getMarketMeta: (conditionIds) => getMarketMeta(db, conditionIds),
         send,
         minTimestamp,
       });
@@ -94,4 +117,38 @@ export function startAlertEngine(): void {
   }
 
   loop();
+
+  // --- Smart-money consensus loop ---------------------------------------
+  // Every 5 minutes: pull a 6h window at a $2k floor and alert when >=2
+  // whitelist wallets have each net-bought >=$5k of the SAME outcome. Runs on
+  // its own cadence because the window fetch (up to 20 pages) is far heavier
+  // than the 4s tick; state-table dedup means only formations/escalations push.
+  const CONSENSUS_INTERVAL_MS = 5 * 60_000;
+  const CONSENSUS_WINDOW_SEC = 6 * 3600;
+  const CONSENSUS_FLOOR_USD = 2000;
+
+  async function consensusLoop() {
+    try {
+      const fired = await runConsensusCycle({
+        db,
+        fetchWindow: () =>
+          getTradesWindowDeep({
+            minUsd: CONSENSUS_FLOOR_USD,
+            sinceSec: Math.floor(Date.now() / 1000) - CONSENSUS_WINDOW_SEC,
+          }),
+        getSmart: () => getAllSmartTags(db),
+        send,
+      });
+      if (fired > 0) {
+        console.log(`[engine] consensus cycle fired ${fired} alert(s)`);
+      }
+    } catch (e) {
+      console.error("[engine] consensus cycle error", e);
+    }
+    setTimeout(consensusLoop, CONSENSUS_INTERVAL_MS);
+  }
+
+  // First pass shortly after start (gives the daily seed a head start on a
+  // fresh install; an empty whitelist just skips the cycle).
+  setTimeout(consensusLoop, 30_000);
 }

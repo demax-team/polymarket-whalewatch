@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
 import { formatAge, type AgeTone } from "./ageFormat";
+import { iconTip } from "./glossary";
 
 /* ---------------------------------------------------------------- TopNav */
 
@@ -15,6 +16,8 @@ const NAV = [
   { href: "/", label: "24h 扫描" },
   { href: "/alerts", label: "实时告警" },
   { href: "/accumulation", label: "拆单累计" },
+  { href: "/consensus", label: "聪明钱共识" },
+  { href: "/glossary", label: "说明" },
 ] as const;
 
 export function TopNav() {
@@ -77,6 +80,24 @@ export function Segmented<T extends string | number>({
         </button>
       ))}
     </div>
+  );
+}
+
+/* ----------------------------------------------------------------- Icon */
+
+// A glossary-backed symbol: hovering any 🐳/🏆/🔥/… shows what it means.
+// Tooltip text comes from app/glossary.ts (the same source as /glossary),
+// so meanings can never drift between the hover and the docs page.
+export function Icon({ s, title }: { s: string; title?: string }) {
+  const tip = title ?? iconTip(s);
+  return (
+    <span
+      title={tip}
+      style={tip ? { cursor: "help" } : undefined}
+      aria-label={tip || undefined}
+    >
+      {s}
+    </span>
   );
 }
 
@@ -149,7 +170,91 @@ const AGE_CLASS: Record<AgeTone, string> = {
 // from formatAge per product choice; tone drives the (financial) color.
 export function AgeBadge({ ageDays }: { ageDays: number | null | undefined }) {
   const { text, tone } = formatAge(ageDays);
-  return <span className={AGE_CLASS[tone]}>{text}</span>;
+  const title =
+    ageDays == null
+      ? iconTip("…")
+      : "地址年龄：钱包首次 Polymarket 活动至今。🆕 = ≤30 天新钱包，红色 = <7 天 — 为一笔交易专门开的新钱包是最强内幕信号之一";
+  return (
+    <span className={AGE_CLASS[tone]} title={title} style={{ cursor: "help" }}>
+      {text}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------ WalletStatsBadge */
+
+// Client-safe mirror of lib/walletStats.WalletStats (type-only; the lib module
+// itself imports better-sqlite3 and must stay server-only).
+export type WalletStatsLite = {
+  winRate: number | null;
+  realizedPnl: number;
+  roi: number | null;
+  settledCount: number;
+  truncated: boolean;
+};
+
+export type SmartInfoLite = { score: number | null; isWhitelist: boolean };
+
+// Compact signed USD: +$38k / −$1.2m. Sub-$1k amounts round to whole dollars.
+export function fmtSignedUsdCompact(n: number): string {
+  const sign = n < 0 ? "−" : "+";
+  const abs = Math.abs(n);
+  const num =
+    abs >= 1_000_000
+      ? `${(abs / 1_000_000).toFixed(1)}m`
+      : abs >= 1_000
+        ? `${(abs / 1_000).toFixed(abs >= 10_000 ? 0 : 1)}k`
+        : `${Math.round(abs)}`;
+  return `${sign}$${num}`;
+}
+
+// Settled-market track record for a wallet row: "72% · +$38k", green when the
+// wallet is net-profitable, red when net-losing. `undefined` = still loading,
+// `null` = lookup failed, settledCount 0 = no settled history yet.
+export function WalletStatsBadge({
+  stats,
+  smart,
+}: {
+  stats: WalletStatsLite | null | undefined;
+  smart?: SmartInfoLite | null;
+}) {
+  const trophy = smart ? (
+    <span
+      className="ds-tag ds-tag--brand"
+      title={`聪明钱白名单${smart.score != null ? ` · 评分 ${Math.round(smart.score)}` : ""}`}
+    >
+      🏆
+    </span>
+  ) : null;
+  if (stats === undefined) {
+    return (
+      <span className="mono muted">
+        {trophy}
+        {trophy ? " " : ""}…
+      </span>
+    );
+  }
+  if (stats === null || stats.settledCount === 0) {
+    return (
+      <span className="mono muted" title="无已结算战绩">
+        {trophy}
+        {trophy ? " " : ""}—
+      </span>
+    );
+  }
+  const pct = Math.round((stats.winRate ?? 0) * 100);
+  const tone = stats.realizedPnl >= 0 ? "up" : "down";
+  const title =
+    `已结算 ${stats.settledCount}${stats.truncated ? "+" : ""} 市场 · 胜率 ${pct}%` +
+    (stats.roi != null ? ` · ROI ${(stats.roi * 100).toFixed(1)}%` : "");
+  return (
+    <span className="mono" title={title} style={{ whiteSpace: "nowrap" }}>
+      {trophy}
+      {trophy ? " " : ""}
+      {pct}% ·{" "}
+      <span className={tone}>{fmtSignedUsdCompact(stats.realizedPnl)}</span>
+    </span>
+  );
 }
 
 /* ---------------------------------------------------------- SoundToggle */
