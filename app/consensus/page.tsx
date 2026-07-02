@@ -24,6 +24,7 @@ type ConsensusGroup = {
   lastTs: number;
   currentPrice: number | null;
   category: string | null;
+  closed: boolean;
 };
 
 type ConsensusResponse = {
@@ -306,6 +307,14 @@ export default function ConsensusPage() {
                       <td>
                         {gap == null ? (
                           <span className="muted">—</span>
+                        ) : g.closed ? (
+                          // Settled market: following is moot — show whether
+                          // the smart-money consensus was RIGHT instead.
+                          g.currentPrice != null && g.currentPrice > 0.5 ? (
+                            <Tag variant="up">已结算 ✓ 命中</Tag>
+                          ) : (
+                            <Tag variant="down">已结算 ✗ 落空</Tag>
+                          )
                         ) : gap <= FOLLOWABLE_GAP ? (
                           <Tag variant="up">
                             仍可跟 {gap >= 0 ? "+" : ""}

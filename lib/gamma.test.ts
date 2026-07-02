@@ -57,11 +57,34 @@ describe("fetchMarketMeta", () => {
         ok: true,
         json: async () => ids.slice(0, 20).map((c) => gammaRow(c)),
       })
-      .mockResolvedValueOnce({ ok: false, status: 500 });
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      // closed=true retry sweep for the failed chunk's ids — also empty here.
+      .mockResolvedValue({ ok: true, json: async () => [] });
     vi.stubGlobal("fetch", fetchMock);
     const out = await fetchMarketMeta(ids);
     expect(Object.keys(out)).toHaveLength(20); // chunk 1 kept, chunk 2 skipped
     warnSpy.mockRestore();
+  });
+
+  it("finds SETTLED markets via the closed=true second sweep (plain query excludes them)", async () => {
+    // Verified live: /markets?condition_ids= returns 0 rows for a closed
+    // market unless closed=true is passed — the settlement backfill depends
+    // on this second sweep.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => [] }) // open sweep: not found
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          gammaRow("0xsettled", { closed: true, outcomePrices: '["1", "0"]' }),
+        ],
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const out = await fetchMarketMeta(["0xsettled"]);
+    expect(out["0xsettled"]?.closed).toBe(true);
+    expect(out["0xsettled"]?.outcomePrices).toEqual([1, 0]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toContain("closed=true");
   });
 
   it("chunks large id sets into multiple requests", async () => {

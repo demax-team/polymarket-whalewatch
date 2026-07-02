@@ -41,6 +41,8 @@ const ALLOWED_HOURS = new Set([2, 6, 12]);
 type ConsensusView = ConsensusGroup & {
   currentPrice: number | null;
   category: string | null;
+  // Settled market: the "follow gap" is moot — the page shows hit/miss instead.
+  closed: boolean;
 };
 
 export async function GET(req: Request) {
@@ -87,6 +89,7 @@ export async function GET(req: Request) {
           currentPrice:
             typeof price === "number" && Number.isFinite(price) ? price : null,
           category: m?.category ?? null,
+          closed: m?.closed ?? false,
         };
       });
 

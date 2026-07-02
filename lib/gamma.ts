@@ -60,19 +60,20 @@ function normalize(row: Record<string, unknown>): MarketMeta | null {
   };
 }
 
-export async function fetchMarketMeta(
-  conditionIds: string[],
-): Promise<Record<string, MarketMeta>> {
-  const distinct = [...new Set(conditionIds.filter(Boolean))];
-  const out: Record<string, MarketMeta> = {};
-  for (let i = 0; i < distinct.length; i += CHUNK) {
-    const chunk = distinct.slice(i, i + CHUNK);
-    const qs = chunk
-      .map((c) => `condition_ids=${encodeURIComponent(c)}`)
-      .join("&");
-    // A failing chunk (transient 5xx / timeout) is skipped, not thrown: the
-    // markets it covered simply stay absent so callers retry them later,
-    // while every other chunk's results are kept.
+// One chunked sweep over /markets with an optional extra query-string suffix,
+// merging normalized rows into `out`. A failing chunk (transient 5xx /
+// timeout) is skipped, not thrown: the markets it covered simply stay absent
+// so callers retry them later, while every other chunk's results are kept.
+async function sweepMarkets(
+  ids: string[],
+  extraQs: string,
+  out: Record<string, MarketMeta>,
+): Promise<void> {
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const qs =
+      chunk.map((c) => `condition_ids=${encodeURIComponent(c)}`).join("&") +
+      extraQs;
     try {
       const res = await fetch(`${GAMMA_API}/markets?${qs}`, {
         signal: AbortSignal.timeout(10_000),
@@ -96,6 +97,23 @@ export async function fetchMarketMeta(
         e,
       );
     }
+  }
+}
+
+export async function fetchMarketMeta(
+  conditionIds: string[],
+): Promise<Record<string, MarketMeta>> {
+  const distinct = [...new Set(conditionIds.filter(Boolean))];
+  const out: Record<string, MarketMeta> = {};
+  // Verified live: /markets EXCLUDES closed markets unless closed=true is
+  // passed explicitly — a settled market returns 0 rows on the plain query.
+  // So: first sweep gets open markets, and whatever is still missing gets a
+  // second closed=true sweep. Without this, settlement backfill (which needs
+  // closed markets by definition) would never resolve anything.
+  await sweepMarkets(distinct, "", out);
+  const missing = distinct.filter((c) => !out[c]);
+  if (missing.length > 0) {
+    await sweepMarkets(missing, "&closed=true", out);
   }
   return out;
 }
