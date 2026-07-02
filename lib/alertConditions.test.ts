@@ -22,6 +22,7 @@ describe("alertConditions", () => {
       minPrice: 0.2,
       maxPrice: 0.9,
       maxAgeDays: 7,
+      smartOnly: true,
     };
     setAlertConditions(db, c);
     expect(getAlertConditions(db)).toEqual(c);

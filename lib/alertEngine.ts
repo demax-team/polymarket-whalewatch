@@ -12,6 +12,12 @@ export interface EngineDeps {
   conditions: AlertConditions;
   // ageDays by lowercased wallet (null = unknown). Only called when an age cap is set.
   getAges: (wallets: string[]) => Promise<Record<string, number | null>>;
+  // Smart-wallet tags by lowercased wallet (sync SQLite lookup). Absent entries
+  // mean "not smart". When the dep itself is undefined, no tagging happens and
+  // smartOnly matches nothing (there is no whitelist to match against).
+  getSmart?: (
+    wallets: string[],
+  ) => Record<string, { score: number | null } | undefined>;
   // Optional Telegram push; when undefined, matches are still recorded to SQLite.
   send?: (html: string) => Promise<void>;
   // Only consider trades with timestamp >= this (prevents replaying historical backlog).
@@ -34,7 +40,8 @@ export interface EngineDeps {
  * already marked seen are never re-evaluated against new conditions.
  */
 export async function runAlertCycle(deps: EngineDeps): Promise<number> {
-  const { db, fetchTrades, conditions, getAges, send, minTimestamp } = deps;
+  const { db, fetchTrades, conditions, getAges, getSmart, send, minTimestamp } =
+    deps;
 
   if (!conditions.enabled) return 0;
 
@@ -56,6 +63,15 @@ export async function runAlertCycle(deps: EngineDeps): Promise<number> {
     return true;
   });
 
+  // Smart-wallet tagging (cheap sync SQLite lookup) — used both for the
+  // smartOnly filter and for the 🏆 tag / type='smart' on fired alerts.
+  const smartTags = getSmart
+    ? getSmart([...new Set(survivors.map((t) => t.proxyWallet.toLowerCase()))])
+    : {};
+  if (conditions.smartOnly) {
+    survivors = survivors.filter((t) => smartTags[t.proxyWallet.toLowerCase()]);
+  }
+
   // Address-age filter (network-bound) — only when a cap is set and survivors remain.
   if (conditions.maxAgeDays != null && survivors.length > 0) {
     const cap = conditions.maxAgeDays;
@@ -73,11 +89,18 @@ export async function runAlertCycle(deps: EngineDeps): Promise<number> {
   // Fire alerts for the final matches (already oldest-first from selectNewTrades).
   for (const t of survivors) {
     const k = dedupKey(t);
+    const smart = smartTags[t.proxyWallet.toLowerCase()];
     // At-least-once: send first; if send() throws, the trade is NOT marked seen
     // below (we throw out of the loop) and retries next cycle.
-    if (send) await send(formatLargeTradeAlert(t, conditions.minUsd));
+    if (send) await send(formatLargeTradeAlert(t, conditions.minUsd, smart));
     markSeen(db, k, t.timestamp);
-    recordAlert(db, "large", k, JSON.stringify(t), t.timestamp);
+    recordAlert(
+      db,
+      smart ? "smart" : "large",
+      k,
+      JSON.stringify(t),
+      t.timestamp,
+    );
   }
 
   // Mark every evaluated fresh trade seen (matches were marked above; this covers

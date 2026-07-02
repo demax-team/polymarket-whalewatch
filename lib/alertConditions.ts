@@ -10,6 +10,7 @@ export interface AlertConditions {
   minPrice: number | null; // 0..1, null = no lower bound
   maxPrice: number | null; // 0..1, null = no upper bound
   maxAgeDays: number | null; // address-age cap in days, null = no cap
+  smartOnly: boolean; // only fire for wallets present in smart_wallets
 }
 
 export const DEFAULT_CONDITIONS: AlertConditions = {
@@ -19,6 +20,7 @@ export const DEFAULT_CONDITIONS: AlertConditions = {
   minPrice: null,
   maxPrice: null,
   maxAgeDays: null,
+  smartOnly: false,
 };
 
 const CONFIG_KEY = "alert_conditions";

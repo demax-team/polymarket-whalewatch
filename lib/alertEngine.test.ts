@@ -193,6 +193,71 @@ describe("runAlertCycle", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it("(i) smart-wallet trades get the 🏆 tag and type='smart'", async () => {
+    const db = openDb(":memory:");
+    const smartTrade = mk({ transactionHash: "0xs", proxyWallet: "0xSMART" });
+    const plainTrade = mk({ transactionHash: "0xp", proxyWallet: "0xPLAIN" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const getSmart = vi.fn((_wallets: string[]) => ({
+      "0xsmart": { score: 82 },
+    }));
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [smartTrade, plainTrade],
+      conditions: cond({ minUsd: 10000 }),
+      getAges: noAges,
+      getSmart,
+      send,
+      minTimestamp: 0,
+    });
+
+    expect(fired).toBe(2);
+    const sent = send.mock.calls.map((c) => c[0] as string);
+    expect(sent.some((m) => m.includes("🏆 聪明钱(82)"))).toBe(true);
+    const types = db
+      .prepare("SELECT type, dedup_key FROM alerts ORDER BY id")
+      .all() as { type: string; dedup_key: string }[];
+    expect(new Set(types.map((r) => r.type))).toEqual(
+      new Set(["smart", "large"]),
+    );
+    expect(types.find((r) => r.dedup_key === dedupKey(smartTrade))?.type).toBe(
+      "smart",
+    );
+  });
+
+  it("(j) smartOnly keeps only smart-wallet trades (and matches nothing without getSmart)", async () => {
+    const db = openDb(":memory:");
+    const smartTrade = mk({ transactionHash: "0xs", proxyWallet: "0xSMART" });
+    const plainTrade = mk({ transactionHash: "0xp", proxyWallet: "0xPLAIN" });
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [smartTrade, plainTrade],
+      conditions: cond({ minUsd: 10000, smartOnly: true }),
+      getAges: noAges,
+      getSmart: () => ({ "0xsmart": { score: null } }),
+      send,
+      minTimestamp: 0,
+    });
+    expect(fired).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0] as string).toContain("🏆 聪明钱");
+
+    // Without a getSmart dep there is no whitelist — smartOnly matches nothing.
+    const db2 = openDb(":memory:");
+    const fired2 = await runAlertCycle({
+      db: db2,
+      fetchTrades: async () => [mk()],
+      conditions: cond({ minUsd: 10000, smartOnly: true }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+    });
+    expect(fired2).toBe(0);
+  });
+
   it("(h) Telegram-less (send undefined) still records to alerts", async () => {
     const db = openDb(":memory:");
     const t = mk();

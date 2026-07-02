@@ -31,6 +31,7 @@ type AlertConditions = {
   minPrice: number | null;
   maxPrice: number | null;
   maxAgeDays: number | null;
+  smartOnly: boolean;
 };
 
 const DEFAULT_CONDITIONS: AlertConditions = {
@@ -40,6 +41,7 @@ const DEFAULT_CONDITIONS: AlertConditions = {
   minPrice: null,
   maxPrice: null,
   maxAgeDays: null,
+  smartOnly: false,
 };
 
 function fmtUsd(usd: number): string {
@@ -116,6 +118,7 @@ function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
       minPrice: numOrNull(minPriceText),
       maxPrice: numOrNull(maxPriceText),
       maxAgeDays: numOrNull(ageText),
+      smartOnly: c.smartOnly,
     };
     try {
       const res = await fetch("/api/alert-config", {
@@ -242,6 +245,25 @@ function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
           style={{ width: 70 }}
         />
         <span className="ds-hint">天（留空 = 不限）</span>
+      </Field>
+
+      <Field label="聪明钱">
+        <label
+          className="ds-hint"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "var(--s-1)",
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={c.smartOnly}
+            onChange={(e) => setC({ ...c, smartOnly: e.target.checked })}
+          />
+          只推送聪明钱白名单钱包（🏆，每日自动从官方盈利榜播种）
+        </label>
       </Field>
 
       <div

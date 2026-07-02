@@ -5,6 +5,7 @@ import { sendMessage } from "../lib/telegram";
 import { getWalletAges } from "../lib/walletAge";
 import { getAlertConditions } from "../lib/alertConditions";
 import { runAlertCycle } from "../lib/alertEngine";
+import { getSmartTags, maybeDailySeed } from "../lib/smartWallets";
 
 // Guarded singleton: instrumentation may call this more than once (per runtime),
 // and `npm run worker` also calls it — the flag makes every call after the first
@@ -77,12 +78,24 @@ export function startAlertEngine(): void {
 
   async function loop() {
     try {
+      // Daily (UTC) smart-wallet seeding from the official leaderboards. Fire
+      // and forget: seeding can take a while (per-wallet /closed-positions
+      // enrichment) and must never delay the 4s alert cycle.
+      maybeDailySeed(db)
+        ?.then((r) =>
+          console.log(
+            `[engine] smart-wallet seed: ${r.seeded} wallets (${r.enriched} enriched)`,
+          ),
+        )
+        .catch((e) => console.error("[engine] smart-wallet seed failed", e));
+
       const conditions = getAlertConditions(db);
       const fired = await runAlertCycle({
         db,
         fetchTrades: () => fetchTrades(conditions.minUsd),
         conditions,
         getAges,
+        getSmart: (wallets) => getSmartTags(db, wallets),
         send,
         minTimestamp,
       });

@@ -7,10 +7,14 @@ const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 export function formatLargeTradeAlert(
   t: Trade,
   tier: number,
-  smart?: { score: number },
+  smart?: { score: number | null },
 ): string {
   const n = notionalUsd(t);
-  const tag = smart ? `🏆 聪明钱(${smart.score.toFixed(0)}) ` : "";
+  const tag = smart
+    ? smart.score != null
+      ? `🏆 聪明钱(${smart.score.toFixed(0)}) `
+      : "🏆 聪明钱 "
+    : "";
   // tier is already the highest threshold n cleared (see runOnce), so 🐳 = top tier (>= $50k)
   const whale = tier >= 50000 ? "🐳 " : "💰 ";
   return [
