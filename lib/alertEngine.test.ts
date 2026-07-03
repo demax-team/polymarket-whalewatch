@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { openDb } from "./db";
-import { runAlertCycle } from "./alertEngine";
+import { MAX_AGE_LOOKUP_CYCLES, runAlertCycle } from "./alertEngine";
 import { DEFAULT_CONDITIONS, type AlertConditions } from "./alertConditions";
 import { dedupKey } from "./trades";
 import { markSeen } from "./seen";
@@ -103,24 +103,26 @@ describe("runAlertCycle", () => {
     expect(fired).toBe(1);
   });
 
-  it("(d) age filter drops too-old and unknown-age wallets", async () => {
+  it("(d) age filter drops too-old and verified-empty (null) wallets deterministically", async () => {
     const db = openDb(":memory:");
     const young = mk({ transactionHash: "0xy", proxyWallet: "0xYOUNG" });
     const old = mk({ transactionHash: "0xo", proxyWallet: "0xOLD" });
-    const unknown = mk({ transactionHash: "0xu", proxyWallet: "0xUNKNOWN" });
+    // null = the /activity probe VERIFIED there is no history — a settled
+    // verdict, dropped for good (unlike a FAILED lookup, see test (s)).
+    const empty = mk({ transactionHash: "0xu", proxyWallet: "0xEMPTY" });
     const send = vi.fn().mockResolvedValue(undefined);
 
     const getAges = vi.fn(
       async (_wallets: string[]): Promise<Record<string, number | null>> => ({
         "0xyoung": 3,
         "0xold": 99,
-        "0xunknown": null,
+        "0xempty": null,
       }),
     );
 
     const fired = await runAlertCycle({
       db,
-      fetchTrades: async () => [young, old, unknown],
+      fetchTrades: async () => [young, old, empty],
       conditions: cond({ maxAgeDays: 7, minUsd: 10000 }),
       getAges,
       send,
@@ -132,7 +134,86 @@ describe("runAlertCycle", () => {
     // getAges asked for the distinct lowercased survivor wallets
     expect(getAges).toHaveBeenCalledTimes(1);
     const asked = getAges.mock.calls[0][0];
-    expect(new Set(asked)).toEqual(new Set(["0xyoung", "0xold", "0xunknown"]));
+    expect(new Set(asked)).toEqual(new Set(["0xyoung", "0xold", "0xempty"]));
+    // Deterministic drops ARE swept as seen — they never re-evaluate.
+    const seen = db.prepare("SELECT COUNT(*) AS c FROM seen_trades").get() as {
+      c: number;
+    };
+    expect(seen.c).toBe(3);
+  });
+
+  it("(s) a FAILED age lookup (wallet absent) defers the trade to the next cycle instead of swallowing it", async () => {
+    const db = openDb(":memory:");
+    const t = mk({ transactionHash: "0xagedefer", proxyWallet: "0xNEW" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const ageRetries = new Map<string, number>();
+    const base = {
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000, maxAgeDays: 7 }),
+      send,
+      minTimestamp: 0,
+      ageRetries,
+    };
+
+    // Cycle 1: /activity down → wallet ABSENT from ages → no fire, NOT seen.
+    expect(await runAlertCycle({ ...base, getAges: async () => ({}) })).toBe(0);
+    expect(
+      db
+        .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+        .get(dedupKey(t)),
+    ).toBeUndefined();
+    expect(ageRetries.get(dedupKey(t))).toBe(1);
+
+    // Cycle 2: lookup recovered → the same trade fires normally, ledger clear.
+    expect(
+      await runAlertCycle({ ...base, getAges: async () => ({ "0xnew": 3 }) }),
+    ).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ageRetries.size).toBe(0);
+  });
+
+  it("(t) gives up (marks seen + warns) after MAX_AGE_LOOKUP_CYCLES consecutive failed age lookups", async () => {
+    const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const t = mk({ transactionHash: "0xageforever", proxyWallet: "0xNEW" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const ageRetries = new Map<string, number>();
+    const base = {
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000, maxAgeDays: 7 }),
+      getAges: async () => ({}), // permanently failing lookup
+      send,
+      minTimestamp: 0,
+      ageRetries,
+    };
+
+    // Cycles 1..N-1: deferred (never marked seen, never fired).
+    for (let i = 1; i < MAX_AGE_LOOKUP_CYCLES; i++) {
+      expect(await runAlertCycle(base)).toBe(0);
+      expect(
+        db
+          .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+          .get(dedupKey(t)),
+      ).toBeUndefined();
+      expect(ageRetries.get(dedupKey(t))).toBe(i);
+    }
+    // Cycle N: give up — swept as seen with a warn, ledger entry removed.
+    expect(await runAlertCycle(base)).toBe(0);
+    expect(
+      db
+        .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+        .get(dedupKey(t)),
+    ).toBeDefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("giving up"));
+    expect(ageRetries.size).toBe(0);
+    // Even a later lookup recovery cannot resurrect it (already seen).
+    expect(
+      await runAlertCycle({ ...base, getAges: async () => ({ "0xnew": 3 }) }),
+    ).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it("(e) timestamp gate: pre-window trades never fire but are seeded seen once", async () => {

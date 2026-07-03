@@ -160,6 +160,27 @@ describe("getWalletStats", () => {
     warnSpy.mockRestore();
   });
 
+  it("dedupes concurrent lookups for the same wallet via the in-flight map", async () => {
+    const db1 = openDb(":memory:");
+    const db2 = openDb(":memory:");
+    let release!: (v: WalletStats) => void;
+    const gate = new Promise<WalletStats>((r) => (release = r));
+    const fetcher = vi.fn((_w: string) => gate);
+    const inFlight = new Map<string, Promise<WalletStats>>();
+    // Two overlapping calls (wallet page + daily seed enrichment) miss their
+    // caches simultaneously — the second must JOIN the first's fetch (up to 8
+    // /closed-positions pages), not start its own.
+    const p1 = getWalletStats(db1, ["0xAAA"], { fetcher, inFlight });
+    const p2 = getWalletStats(db2, ["0xAAA"], { fetcher, inFlight });
+    release(stats());
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1["0xaaa"]).toEqual(stats());
+    expect(r2["0xaaa"]).toEqual(stats());
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    // Entry removed on settle so a later cold call fetches fresh.
+    expect(inFlight.size).toBe(0);
+  });
+
   it("preserves null winRate/roi through the cache round-trip", async () => {
     const db = openDb(":memory:");
     const empty = stats({

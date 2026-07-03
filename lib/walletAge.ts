@@ -65,42 +65,89 @@ export async function fetchFirstActivityTs(
   return candidate;
 }
 
-// Returns wallet(lowercased) -> firstTs|null. SQLite-cached; only real (non-null) ages
-// are persisted permanently (errors stay uncached so they retry). Misses are fetched
-// with a concurrency cap. `fetcher` is injectable for tests.
+// Verified-empty cache TTL: a wallet with "no activity yet" can turn real any
+// minute (it just traded — /activity may simply lag), so empty results are
+// reused only briefly instead of being re-probed at FULL price (1 sorted page
+// + up to MAX_VERIFY_PROBES) every single time the wallet appears.
+const EMPTY_TTL_SEC = 3600;
+
+// In-flight dedup across concurrent calls: the alert cycle's age filter and a
+// wallet page opened at the same moment would otherwise EACH spend up to
+// 1 + MAX_VERIFY_PROBES /activity requests on the same cold wallet. Keyed by
+// lowercased wallet; entries drop once settled so failures retry next call.
+const inFlightAges = new Map<string, Promise<number | null>>();
+
+/**
+ * Returns wallet(lowercased) -> firstTs with three distinct outcomes:
+ *   number — verified first activity ts, persisted PERMANENTLY;
+ *   null   — verified "no activity yet", persisted as a first_ts=NULL row and
+ *            reused for EMPTY_TTL_SEC (then re-probed);
+ *   ABSENT — the lookup THREW (timeout/5xx): never persisted and never
+ *            reported as null, so callers can tell "fetch failed, retry later"
+ *            from "verified empty" (the alert engine defers on absent).
+ * Misses are fetched with a concurrency cap; concurrent calls share one
+ * in-flight fetch per wallet. `fetcher`/`nowSec`/`inFlight` are injectable
+ * for tests.
+ */
 export async function getWalletAges(
   db: DB,
   wallets: string[],
   opts: {
     concurrency?: number;
     fetcher?: (w: string) => Promise<number | null>;
+    nowSec?: number;
+    inFlight?: Map<string, Promise<number | null>>;
   } = {},
 ): Promise<Record<string, number | null>> {
-  const { concurrency = 6, fetcher = fetchFirstActivityTs } = opts;
+  const {
+    concurrency = 6,
+    fetcher = fetchFirstActivityTs,
+    nowSec = Math.floor(Date.now() / 1000),
+    inFlight = inFlightAges,
+  } = opts;
   const distinct = [...new Set(wallets.map((w) => w.toLowerCase()))];
-  const sel = db.prepare("SELECT first_ts FROM wallet_age WHERE wallet = ?");
+  const sel = db.prepare(
+    "SELECT first_ts, fetched_at FROM wallet_age WHERE wallet = ?",
+  );
   const ins = db.prepare(
     "INSERT OR REPLACE INTO wallet_age (wallet, first_ts, fetched_at) VALUES (?, ?, ?)",
   );
   const result: Record<string, number | null> = {};
   const misses: string[] = [];
   for (const w of distinct) {
-    const row = sel.get(w) as { first_ts: number | null } | undefined;
-    if (row) result[w] = row.first_ts;
-    else misses.push(w);
+    const row = sel.get(w) as
+      { first_ts: number | null; fetched_at: number | null } | undefined;
+    if (row && row.first_ts !== null) {
+      result[w] = row.first_ts; // a real first_ts never changes → permanent
+    } else if (row && nowSec - (row.fetched_at ?? 0) < EMPTY_TTL_SEC) {
+      result[w] = null; // verified-empty, still fresh
+    } else {
+      misses.push(w); // uncached, or a verified-empty row past its TTL
+    }
   }
+  // ok:false = the fetch THREW — kept apart from a successful "no activity"
+  // (ok:true, ts:null) so only real failures stay uncached and absent.
   const fetched = await mapLimit(misses, concurrency, async (w) => {
+    let p = inFlight.get(w);
+    if (!p) {
+      p = fetcher(w);
+      inFlight.set(w, p);
+      // Settle-time cleanup; the leading catch keeps a rejected fetch from
+      // surfacing as unhandled here (every awaiter handles it below).
+      p.catch(() => {}).finally(() => inFlight.delete(w));
+    }
     try {
-      return await fetcher(w);
-    } catch {
-      return null;
+      return { ok: true as const, ts: await p };
+    } catch (e) {
+      console.warn(`[walletAge] first-ts lookup failed for ${w}:`, e);
+      return { ok: false as const };
     }
   });
-  const now = Math.floor(Date.now() / 1000);
   misses.forEach((w, idx) => {
-    const ts = fetched[idx];
-    if (ts !== null) ins.run(w, ts, now); // cache only successful lookups
-    result[w] = ts;
+    const f = fetched[idx];
+    if (!f.ok) return; // failed lookup: uncached AND absent from the result
+    ins.run(w, f.ts, nowSec); // persists verified-empty (ts=null) rows too
+    result[w] = f.ts;
   });
   return result;
 }

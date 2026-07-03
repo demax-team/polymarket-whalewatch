@@ -14,12 +14,29 @@ import {
   unmarkSeen,
 } from "./seen";
 
+// A trade whose wallet-age lookup keeps FAILING is deferred (retried next
+// cycle, not marked seen) for this many consecutive cycles before being given
+// up with a warn — a persistent /activity outage must not pin the same trades
+// in the retry path forever.
+export const MAX_AGE_LOOKUP_CYCLES = 5;
+
+// Cross-cycle retry ledger for the age-deferred path: dedupKey -> consecutive
+// cycles the wallet-age lookup has failed. Module-level because runAlertCycle
+// itself is stateless between cycles; injectable per-call for tests. Entries
+// are removed on resolution or give-up, so the map stays tiny.
+const defaultAgeRetries = new Map<string, number>();
+
 export interface EngineDeps {
   db: DB;
   fetchTrades: () => Promise<Trade[]>;
   conditions: AlertConditions;
-  // ageDays by lowercased wallet (null = unknown). Only called when an age cap is set.
+  // ageDays by lowercased wallet. Semantics: number = known age; null =
+  // VERIFIED "no activity yet" (deterministic drop); ABSENT = the lookup
+  // FAILED (trade is deferred and re-evaluated next cycle, see the age
+  // filter). Only called when an age cap is set.
   getAges: (wallets: string[]) => Promise<Record<string, number | null>>;
+  // Retry ledger for failed age lookups (see defaultAgeRetries above).
+  ageRetries?: Map<string, number>;
   // Smart-wallet tags by lowercased wallet (sync SQLite lookup). Absent entries
   // mean "not smart". When the dep itself is undefined, no tagging happens and
   // smartOnly matches nothing (there is no whitelist to match against).
@@ -49,7 +66,10 @@ export interface EngineDeps {
  *     backlog (< minTimestamp) as seen ONCE instead of re-checking it forever.
  *  3. amount / side / price-band filters (pure, no I/O).
  *  4. age filter (only if maxAgeDays set): fetch ages for survivor wallets, keep
- *     wallets with a finite ageDays <= cap (unknown-age and older are dropped).
+ *     wallets with a finite ageDays <= cap. Verified-empty (null) and older
+ *     wallets are dropped; FAILED lookups (absent) are DEFERRED — excluded from
+ *     this cycle and the seen sweep, retried next cycle, given up with a warn
+ *     after MAX_AGE_LOOKUP_CYCLES consecutive failures.
  *  5. for each match (oldest-first): CLAIM via markSeen (cross-process lock),
  *     then push to Telegram; a failed send rolls the claim back and rethrows so
  *     the trade retries next cycle (at-least-once). A lost claim skips the push
@@ -68,6 +88,7 @@ export async function runAlertCycle(deps: EngineDeps): Promise<number> {
     fetchTrades,
     conditions,
     getAges,
+    ageRetries = defaultAgeRetries,
     getSmart,
     getMarketMeta,
     send,
@@ -121,18 +142,49 @@ export async function runAlertCycle(deps: EngineDeps): Promise<number> {
     survivors = survivors.filter((t) => smartTags[t.proxyWallet.toLowerCase()]);
   }
 
-  // Address-age filter (network-bound) — only when a cap is set and survivors remain.
+  // Address-age filter (network-bound) — only when a cap is set and survivors
+  // remain. maxAgeDays exists to catch NEW wallets, exactly the ones that are
+  // always a cold-cache live /activity fetch — so a wallet ABSENT from `ages`
+  // (lookup FAILED: timeout/5xx, walletAge leaves failures uncached and
+  // unreported) must not be a permanent drop. Those trades are DEFERRED like
+  // missing market meta below: excluded from this cycle AND from the markSeen
+  // sweep so they re-evaluate next cycle; after MAX_AGE_LOOKUP_CYCLES
+  // consecutive failures the trade is given up (falls through to the sweep)
+  // with a warn. `null` = VERIFIED no activity → deterministic drop.
   if (conditions.maxAgeDays != null && survivors.length > 0) {
     const cap = conditions.maxAgeDays;
     const wallets = [
       ...new Set(survivors.map((t) => t.proxyWallet.toLowerCase())),
     ];
     const ages = await getAges(wallets);
+    const ageDeferred = new Set<string>();
     survivors = survivors.filter((t) => {
-      const age = ages[t.proxyWallet.toLowerCase()];
-      // Drop unknown-age (null/undefined) and wallets older than the cap.
+      const w = t.proxyWallet.toLowerCase();
+      const k = dedupKey(t);
+      const age = ages[w];
+      if (age === undefined) {
+        const attempts = (ageRetries.get(k) ?? 0) + 1;
+        if (attempts >= MAX_AGE_LOOKUP_CYCLES) {
+          ageRetries.delete(k);
+          console.warn(
+            `[alertEngine] age lookup failed ${attempts} cycle(s) for ${k} (wallet=${w}) — giving up, trade dropped`,
+          );
+          return false; // stays in `fresh` → the sweep marks it seen for good
+        }
+        ageRetries.set(k, attempts);
+        ageDeferred.add(k);
+        return false;
+      }
+      ageRetries.delete(k); // resolved (real ts or verified-empty)
+      // Drop verified-no-activity (null) and wallets older than the cap.
       return typeof age === "number" && Number.isFinite(age) && age <= cap;
     });
+    if (ageDeferred.size > 0) {
+      fresh = fresh.filter((t) => !ageDeferred.has(dedupKey(t)));
+      console.log(
+        `[alertEngine] age lookup failed for ${ageDeferred.size} trade(s) — deferred to next cycle (not marked seen)`,
+      );
+    }
   }
 
   // Market-context enrichment (batched + cached upstream). Fetched once for

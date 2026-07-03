@@ -90,10 +90,18 @@ async function fetchWalletStats(wallet: string): Promise<WalletStats> {
 
 const DEFAULT_TTL_SEC = 86_400; // track records move slowly; a day is fresh enough
 
+// In-flight dedup across concurrent calls (same pattern as walletAge): a
+// wallet page and the daily seed enriching the same cold wallet would each
+// pull up to 8 /closed-positions pages, with the loser's INSERT OR REPLACE
+// overwriting the winner's for no gain. Keyed by lowercased wallet; entries
+// drop once settled so failures retry next call.
+const inFlightStats = new Map<string, Promise<WalletStats>>();
+
 // Returns wallet(lowercased) -> WalletStats|null. SQLite-cached with a TTL
 // (unlike wallet_age, a track record CHANGES as markets settle, so entries
 // expire). Errors return null and stay uncached so the next call retries.
-// `fetcher` is injectable for tests.
+// Concurrent calls share one in-flight fetch per wallet. `fetcher`/`inFlight`
+// are injectable for tests.
 export async function getWalletStats(
   db: DB,
   wallets: string[],
@@ -102,6 +110,7 @@ export async function getWalletStats(
     ttlSec?: number;
     fetcher?: (w: string) => Promise<WalletStats>;
     nowSec?: number;
+    inFlight?: Map<string, Promise<WalletStats>>;
   } = {},
 ): Promise<Record<string, WalletStats | null>> {
   const {
@@ -109,6 +118,7 @@ export async function getWalletStats(
     ttlSec = DEFAULT_TTL_SEC,
     fetcher = fetchWalletStats,
     nowSec = Math.floor(Date.now() / 1000),
+    inFlight = inFlightStats,
   } = opts;
   const distinct = [...new Set(wallets.map((w) => w.toLowerCase()))];
   const sel = db.prepare(
@@ -145,8 +155,16 @@ export async function getWalletStats(
     }
   }
   const fetched = await mapLimit(misses, concurrency, async (w) => {
+    let p = inFlight.get(w);
+    if (!p) {
+      p = fetcher(w);
+      inFlight.set(w, p);
+      // Settle-time cleanup; the leading catch keeps a rejected fetch from
+      // surfacing as unhandled here (every awaiter handles it below).
+      p.catch(() => {}).finally(() => inFlight.delete(w));
+    }
     try {
-      return await fetcher(w);
+      return await p;
     } catch (e) {
       console.warn(`[walletStats] fetch failed for ${w}:`, e);
       return null;

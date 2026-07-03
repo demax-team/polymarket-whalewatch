@@ -92,8 +92,10 @@ export function startAlertEngine(): void {
       ` (maxSeenTs=${maxSeenTs ?? "none — cold db"}, minTimestamp=${minTimestamp}, cap=${BACKFILL_CAP_SEC / 60}min)`,
   );
 
-  // walletAge.getWalletAges returns firstActivityTs (unix sec) | null per wallet.
-  // The engine needs ageDays, so convert here.
+  // walletAge.getWalletAges returns firstActivityTs (unix sec) | null per
+  // wallet, with FAILED lookups ABSENT from the map. The engine needs ageDays,
+  // so convert here; absent wallets stay absent (Object.entries skips them) so
+  // runAlertCycle can defer those trades instead of dropping them for good.
   const getAges = async (
     wallets: string[],
   ): Promise<Record<string, number | null>> => {
