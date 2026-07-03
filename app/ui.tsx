@@ -244,9 +244,17 @@ export function WalletStatsBadge({
   }
   const pct = Math.round((stats.winRate ?? 0) * 100);
   const tone = stats.realizedPnl >= 0 ? "up" : "down";
+  // Survivorship caveat mirrors computeScore's haircut cases: 100% or a
+  // truncated record are upper bounds — zeroed positions never settle into
+  // /closed-positions, so "ride it to zero" wallets overstate their win rate.
+  const survivorship =
+    stats.truncated || (stats.winRate != null && stats.winRate >= 1)
+      ? "\n仅含已结算仓位：持有到归零的仓位不计入，死扛型胜率被高估"
+      : "";
   const title =
     `已结算 ${stats.settledCount}${stats.truncated ? "+" : ""} 市场 · 胜率 ${pct}%` +
-    (stats.roi != null ? ` · ROI ${(stats.roi * 100).toFixed(1)}%` : "");
+    (stats.roi != null ? ` · ROI ${(stats.roi * 100).toFixed(1)}%` : "") +
+    survivorship;
   return (
     <span className="mono" title={title} style={{ whiteSpace: "nowrap" }}>
       {trophy}

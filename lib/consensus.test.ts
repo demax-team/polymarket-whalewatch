@@ -180,12 +180,34 @@ describe("runConsensusCycle", () => {
 
   it("skips everything when the whitelist is empty (no seed yet)", async () => {
     const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const fetchWindow = vi.fn();
     const fired = await runConsensusCycle(
       deps(db, { getSmart: () => new Map(), fetchWindow }),
     );
     expect(fired).toBe(0);
     expect(fetchWindow).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("warns about an empty whitelist at most once an hour", async () => {
+    const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Far beyond any nowSec earlier tests used, so the module-level rate-limit
+    // state can't mask the first warn.
+    const base = 4_000_000_000;
+    const empty = (nowSec: number) =>
+      deps(db, { getSmart: () => new Map(), nowSec });
+    await runConsensusCycle(empty(base));
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("whitelist empty");
+    // Within the hour: silent (the 5-min cadence must not spam the logs).
+    await runConsensusCycle(empty(base + 600));
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    // Past the hour: warns again.
+    await runConsensusCycle(empty(base + 3601));
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
   });
 
   it("claim lock: a group recently claimed by another process is not double-pushed", async () => {

@@ -182,6 +182,13 @@ export interface ConsensusCycleDeps {
   nowSec?: number;
 }
 
+// With an empty whitelist every consensus cycle silently no-ops on a 5-min
+// cadence — an all-day-blank pool (seed never ran, or failed and is pending
+// retry) would be indistinguishable from "no signal". Warn hourly, not per
+// cycle, so the cause is diagnosable from the logs without spamming them.
+const EMPTY_WHITELIST_WARN_INTERVAL_SEC = 3600;
+let lastEmptyWhitelistWarnTs = -Infinity;
+
 /**
  * One consensus detection cycle. Fires an alert when a group FORMS or grows to
  * more wallets than previously alerted (escalation); a same-or-smaller group
@@ -200,7 +207,20 @@ export async function runConsensusCycle(
     nowSec = Math.floor(Date.now() / 1000),
   } = deps;
   const smartTags = getSmart();
-  if (smartTags.size === 0) return 0; // whitelist not seeded yet
+  if (smartTags.size === 0) {
+    // Whitelist not seeded yet (or the daily seed failed — see maybeDailySeed
+    // retry markers in the same logs).
+    if (
+      nowSec - lastEmptyWhitelistWarnTs >=
+      EMPTY_WHITELIST_WARN_INTERVAL_SEC
+    ) {
+      lastEmptyWhitelistWarnTs = nowSec;
+      console.warn(
+        "[consensus] whitelist empty — smart-wallet seed has not completed (or failed); consensus detection is idle",
+      );
+    }
+    return 0;
+  }
   const { trades, truncated } = await fetchWindow();
   if (truncated) {
     // Newest-first pagination hit its page cap: the fetched prefix is still a
