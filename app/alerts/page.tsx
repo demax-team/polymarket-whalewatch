@@ -5,6 +5,17 @@ import { Field, Icon, Segmented, SideTag, SoundToggle } from "../ui";
 import { iconTip } from "../glossary";
 import { playBubble } from "../sound";
 import { useSoundToggle } from "../useSound";
+import {
+  OUTCOMES_MIN_INTERVAL_MS,
+  alertsSnapshot,
+  shouldFetchOutcomes,
+} from "../alertsPolling";
+import {
+  directionVerdict,
+  summarizeOutcomes,
+  wilsonInterval,
+  type OutcomeStat,
+} from "../../lib/outcomeStats";
 
 type AlertView = {
   id: number;
@@ -23,6 +34,16 @@ type AlertView = {
 type AlertsResponse = {
   count: number;
   alerts: AlertView[];
+  // smartOnly feedback (see /api/alerts): whitelist pool size and the last-24h
+  // 🏆 alert count. null/absent = unknown (missing table / pre-upgrade API).
+  smartWalletCount?: number | null;
+  smartAlerts24h?: number | null;
+};
+
+// Pool-status props the ConditionsPanel shows beside the smartOnly checkbox.
+type SmartPoolMeta = {
+  smartWalletCount: number | null;
+  smartAlerts24h: number | null;
 };
 
 // On-demand validation data per alert (computed lazily from public history).
@@ -40,6 +61,13 @@ const TYPE_ICON: Record<string, string> = {
   consensus: "🔥",
 };
 
+// Per-type labels for the validation strip's grouped breakdown.
+const TYPE_LABEL: Record<string, string> = {
+  large: "💰大单",
+  smart: "🏆聪明钱",
+  consensus: "🔥共识",
+};
+
 type Side = "ALL" | "BUY" | "SELL";
 
 type AlertConditions = {
@@ -51,17 +79,20 @@ type AlertConditions = {
   maxAgeDays: number | null;
   smartOnly: boolean;
   maxHoursToEnd: number | null;
+  cooldownMinutes: number;
 };
 
+// Mirrors lib/alertConditions DEFAULT_CONDITIONS (pre-hydration placeholder).
 const DEFAULT_CONDITIONS: AlertConditions = {
   enabled: true,
   minUsd: 10000,
   side: "ALL",
   minPrice: null,
-  maxPrice: null,
+  maxPrice: 0.95,
   maxAgeDays: null,
   smartOnly: false,
   maxHoursToEnd: null,
+  cooldownMinutes: 30,
 };
 
 function fmtUsd(usd: number): string {
@@ -80,7 +111,9 @@ function fmtTime(sec: number): string {
 
 // Direction-aware follow-through badge: for a BUY, price moving UP after the
 // signal is confirmation (green); for a SELL, DOWN is confirmation. `entry` is
-// the alert's fill price, `later` the market price at the mark.
+// the alert's fill price, `later` the market price at the mark. Moves inside
+// the shared ε deadband are muted — the SAME deadband the summary strip uses,
+// so a badge never looks like a hit that the stats refuse to count.
 function FollowBadge({
   label,
   entry,
@@ -93,14 +126,53 @@ function FollowBadge({
   side: string;
 }) {
   if (later == null) return null;
-  const delta = later - entry;
-  const cents = delta * 100;
-  const good = side === "SELL" ? delta < 0 : delta > 0;
-  const cls = Math.abs(cents) < 0.05 ? "muted" : good ? "up" : "down";
+  const cents = (later - entry) * 100;
+  const v = directionVerdict(side, entry, later);
+  const cls = v === "push" ? "muted" : v === "hit" ? "up" : "down";
   return (
     <span className={`mono ${cls}`} style={{ whiteSpace: "nowrap" }}>
       {label} {cents >= 0 ? "+" : ""}
       {cents.toFixed(1)}¢
+    </span>
+  );
+}
+
+// One stat of the validation strip: overall hits/total, a Wilson 95% interval
+// when the sample can support one (n ≥ 10; a lone 2/3 = "67%" is really
+// ~21%–94%), and the per-type breakdown so 💰 large and 🏆 smart never hide
+// behind a mixed-pool average.
+function StatLine({ label, stat }: { label: string; stat: OutcomeStat }) {
+  if (stat.total === 0) return null;
+  const pct = Math.round((stat.hits / stat.total) * 100);
+  const small = stat.total < 10;
+  const { lo, hi } = wilsonInterval(stat.hits, stat.total);
+  const parts = Object.entries(stat.byType).map(
+    ([type, t]) => `${TYPE_LABEL[type] ?? type} ${t.hits}/${t.total}`,
+  );
+  return (
+    <span className={small ? "muted" : undefined}>
+      {label}{" "}
+      <strong className="mono">
+        {stat.hits}/{stat.total}
+      </strong>{" "}
+      ({pct}%)
+      {small ? (
+        <span className="muted" style={{ fontSize: "var(--t-sm)" }}>
+          {" "}
+          样本不足
+        </span>
+      ) : (
+        <span className="muted mono" style={{ fontSize: "var(--t-sm)" }}>
+          {" "}
+          95%区间 {Math.round(lo * 100)}–{Math.round(hi * 100)}%
+        </span>
+      )}
+      {parts.length > 1 ? (
+        <span className="muted" style={{ fontSize: "var(--t-sm)" }}>
+          {" "}
+          · {parts.join(" · ")}
+        </span>
+      ) : null}
     </span>
   );
 }
@@ -116,7 +188,13 @@ function numOrNull(s: string): number | null {
 // 告警条件 panel — edits the conditions stored in the `config` table that the
 // embedded engine reads every poll. Telegram-optional: matches always land in the
 // alerts table regardless of whether Telegram is configured.
-function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
+function ConditionsPanel({
+  pollSeconds,
+  smartMeta,
+}: {
+  pollSeconds: number;
+  smartMeta: SmartPoolMeta;
+}) {
   const [c, setC] = useState<AlertConditions>(DEFAULT_CONDITIONS);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -171,6 +249,7 @@ function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
       maxAgeDays: numOrNull(ageText),
       smartOnly: c.smartOnly,
       maxHoursToEnd: numOrNull(hoursToEndText),
+      cooldownMinutes: c.cooldownMinutes,
     };
     try {
       const res = await fetch("/api/alert-config", {
@@ -282,7 +361,9 @@ function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
           className="ds-input ds-input--mono"
           style={{ width: 80 }}
         />
-        <span className="ds-hint">赔率 0–1</span>
+        <span className="ds-hint">
+          赔率 0–1（默认上限 0.95：排除 ≥0.95 的结算扫尾单，清空 = 不设上限）
+        </span>
       </Field>
 
       <Field label="地址年龄">
@@ -313,6 +394,28 @@ function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
         <span className="ds-hint">小时（留空 = 不限；抓结算前突击买入）</span>
       </Field>
 
+      <Field label="冷却窗口">
+        <input
+          type="number"
+          min={0}
+          value={c.cooldownMinutes}
+          onChange={(e) =>
+            setC({
+              ...c,
+              cooldownMinutes: Math.max(
+                0,
+                Math.floor(Number(e.target.value) || 0),
+              ),
+            })
+          }
+          className="ds-input ds-input--mono"
+          style={{ width: 70 }}
+        />
+        <span className="ds-hint">
+          分钟（同一钱包·同一市场冷却期内只推首笔，其余仅入库；0 = 关闭）
+        </span>
+      </Field>
+
       <Field label="聪明钱">
         <label
           className="ds-hint"
@@ -330,7 +433,32 @@ function ConditionsPanel({ pollSeconds }: { pollSeconds: number }) {
           />
           只推送聪明钱白名单钱包（🏆，每日自动从官方盈利榜播种）
         </label>
+        {/* Hit-count feedback: with smartOnly a forever-silent feed is
+            indistinguishable from a broken one — surface the pool size and
+            how many 🏆 alerts the engine actually produced in the last 24h. */}
+        {smartMeta.smartWalletCount != null ? (
+          <span className="ds-hint mono">
+            白名单 {smartMeta.smartWalletCount} 个
+            {smartMeta.smartAlerts24h != null
+              ? ` · 近24h 🏆 ${smartMeta.smartAlerts24h} 条`
+              : ""}
+          </span>
+        ) : null}
       </Field>
+      {c.smartOnly && smartMeta.smartWalletCount === 0 ? (
+        // Same empty-pool copy as the consensus page — the two features share
+        // the same whitelist and the same "seed hasn't run yet" failure mode.
+        <div className="ds-callout ds-callout--warn">
+          聪明钱白名单为空 — 开启后将不会推送任何告警。引擎启动后每日自动从
+          官方盈利榜播种（首次约 1 分钟内完成），播种失败会自动重试
+        </div>
+      ) : null}
+      {c.smartOnly ? (
+        <span className="ds-hint">
+          💡 开启后建议把最低金额降至 $2k–5k：聪明钱大单通常拆小，$10k
+          单笔线与白名单的交集近零
+        </span>
+      ) : null}
 
       <div
         style={{
@@ -369,20 +497,33 @@ export default function Page() {
   // alertId -> validation outcome, filled lazily after the list renders.
   const [outcomes, setOutcomes] = useState<Record<number, AlertOutcome>>({});
 
+  // Last-applied payload fingerprint (alerts + smart-pool counters): an
+  // unchanged poll skips setData so `data` keeps its identity and the
+  // [data]-effects below don't re-run every 5s over the same list.
+  const lastSnapshot = useRef<string>("");
+
   useEffect(() => {
     let active = true;
 
     async function load() {
+      // Background tabs sleep — no fetch, no re-render. The visibilitychange
+      // listener below fires a catch-up load the moment we're foregrounded.
+      if (document.hidden) return;
       try {
         const res = await fetch("/api/alerts", { cache: "no-store" });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = (await res.json()) as AlertsResponse;
         if (!active) return;
-        setData(json);
         setLastRefreshed(
           new Date().toLocaleTimeString("zh-CN", { hour12: false }),
         );
         setError("");
+        const snap =
+          alertsSnapshot(json.alerts) +
+          `|${json.smartWalletCount ?? "?"}|${json.smartAlerts24h ?? "?"}`;
+        if (snap === lastSnapshot.current) return;
+        lastSnapshot.current = snap;
+        setData(json);
       } catch (e) {
         if (!active) return;
         setError(e instanceof Error ? e.message : String(e));
@@ -391,27 +532,58 @@ export default function Page() {
 
     load();
     const id = setInterval(load, 5000);
+    const onVisible = () => {
+      if (!document.hidden) load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       active = false;
       clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
 
   // Lazily fetch validation outcomes for alerts we haven't resolved yet.
   // Unresolved alerts are re-queried (their settlement state can change);
-  // resolved ones are final and skipped. The 5s poll re-runs this effect with
-  // a fresh `data` identity every time, so an in-flight guard stops overlapping
+  // resolved ones are final and skipped. Throttled: the 1h/24h marks move on
+  // an hourly scale, so POSTs fire only for never-queried ids (fresh alerts)
+  // or after OUTCOMES_MIN_INTERVAL_MS — the minute tick below re-arms the
+  // effect between new-alert arrivals. The in-flight guard stops overlapping
   // POSTs while a cold batch (up to 200 upstream price lookups) is computing —
   // and a completed response is ALWAYS merged (idempotent by id), never
   // discarded by an effect re-run.
   const outcomesInFlight = useRef(false);
+  const lastOutcomesAt = useRef(0);
+  // Ids POSTed at least once — a new id bypasses the 60s throttle.
+  const outcomesKnownIds = useRef<Set<number>>(new Set());
+  const [outcomesTick, setOutcomesTick] = useState(0);
   useEffect(() => {
+    const id = setInterval(() => {
+      if (!document.hidden) setOutcomesTick((t) => t + 1);
+    }, OUTCOMES_MIN_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
+  useEffect(() => {
+    // Consensus alerts are tracked too (synthetic BUY at the group's
+    // avgBuyPrice); pre-upgrade consensus payloads missing token fields are
+    // skipped server-side — a cheap parse-and-drop, never an upstream call.
     const want = data.alerts
-      .filter((a) => a.type !== "consensus")
       .map((a) => a.id)
       .filter((id) => !(id in outcomes) || !outcomes[id].resolved);
-    if (want.length === 0 || outcomesInFlight.current) return;
+    if (outcomesInFlight.current) return;
+    if (
+      !shouldFetchOutcomes({
+        wantIds: want,
+        knownIds: outcomesKnownIds.current,
+        lastFetchAt: lastOutcomesAt.current,
+        nowMs: Date.now(),
+      })
+    ) {
+      return;
+    }
     outcomesInFlight.current = true;
+    lastOutcomesAt.current = Date.now();
+    for (const id of want) outcomesKnownIds.current.add(id);
     (async () => {
       try {
         const res = await fetch("/api/alert-outcomes", {
@@ -426,27 +598,23 @@ export default function Page() {
           setOutcomes((prev) => ({ ...prev, ...json.outcomes }));
         }
       } catch {
-        // Best-effort; retried on the next poll.
+        // Best-effort; retried on the next tick / data change.
       } finally {
         outcomesInFlight.current = false;
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- outcomes is
     // intentionally omitted: including it would re-trigger on our own merge.
-  }, [data]);
+  }, [data, outcomesTick]);
 
-  // Aggregate validation stats over whatever has been computed so far.
-  const tracked = data.alerts.filter((a) => a.type !== "consensus");
-  const with24h = tracked.filter((a) => outcomes[a.id]?.price24h != null);
-  const hits24h = with24h.filter((a) => {
-    const d = (outcomes[a.id].price24h as number) - a.price;
-    return a.side === "SELL" ? d < 0 : d > 0;
-  });
-  // 50/50 pushes (won === null) stay out of the win-rate denominator.
-  const resolvedAlerts = tracked.filter(
-    (a) => outcomes[a.id]?.resolved && outcomes[a.id]?.won != null,
-  );
-  const wonAlerts = resolvedAlerts.filter((a) => outcomes[a.id]?.won);
+  // Aggregate validation stats over whatever has been computed so far —
+  // 1h + 24h direction hits and the settled win-rate, grouped by type, with
+  // ε-deadband pushes excluded from both sides (see lib/outcomeStats).
+  const summary = summarizeOutcomes(data.alerts, outcomes);
+  const hasStats =
+    summary.dir1h.total > 0 ||
+    summary.dir24h.total > 0 ||
+    summary.settled.total > 0;
 
   // --- New-alert sound notification -------------------------------------
   // Toggle state + persistence + chime-on-enable live in useSoundToggle; this
@@ -496,17 +664,23 @@ export default function Page() {
             {lastRefreshed ? ` · 最后刷新 ${lastRefreshed}` : ""}
             {error ? <span className="down"> · 刷新失败: {error}</span> : null}
             <span className="muted" style={{ marginLeft: "var(--s-2)" }}>
-              · 每 5 秒自动刷新
+              · 每 5 秒自动刷新（后台标签页暂停）
             </span>
           </div>
         </div>
         <SoundToggle on={soundOn} onToggle={toggle} />
       </header>
 
-      <ConditionsPanel pollSeconds={4} />
+      <ConditionsPanel
+        pollSeconds={4}
+        smartMeta={{
+          smartWalletCount: data.smartWalletCount ?? null,
+          smartAlerts24h: data.smartAlerts24h ?? null,
+        }}
+      />
 
       {/* Validation summary — the "was this signal any good" strip. */}
-      {with24h.length > 0 || resolvedAlerts.length > 0 ? (
+      {hasStats ? (
         <div
           className="ds-callout"
           style={{
@@ -520,25 +694,9 @@ export default function Page() {
           <span>
             <Icon s="📐" /> 信号验证（当前列表）
           </span>
-          {with24h.length > 0 ? (
-            <span>
-              24h 方向命中{" "}
-              <strong className="mono">
-                {hits24h.length}/{with24h.length}
-              </strong>{" "}
-              ({Math.round((hits24h.length / with24h.length) * 100)}%)
-            </span>
-          ) : null}
-          {resolvedAlerts.length > 0 ? (
-            <span>
-              已结算胜率{" "}
-              <strong className="mono">
-                {wonAlerts.length}/{resolvedAlerts.length}
-              </strong>{" "}
-              ({Math.round((wonAlerts.length / resolvedAlerts.length) * 100)}
-              %)
-            </span>
-          ) : null}
+          <StatLine label="1h 方向命中" stat={summary.dir1h} />
+          <StatLine label="24h 方向命中" stat={summary.dir24h} />
+          <StatLine label="已结算胜率" stat={summary.settled} />
         </div>
       ) : null}
 
@@ -607,45 +765,43 @@ export default function Page() {
                       )}
                     </td>
                     <td>
-                      {a.type === "consensus" ? (
-                        <span className="muted">—</span>
-                      ) : (
-                        <span
-                          style={{
-                            display: "flex",
-                            gap: "var(--s-2)",
-                            alignItems: "center",
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <FollowBadge
-                            label="1h"
-                            entry={a.price}
-                            later={o?.price1h ?? null}
-                            side={a.side}
+                      {/* Consensus rows validate too: entry = the group's
+                          avgBuyPrice, timed at the last member fill. */}
+                      <span
+                        style={{
+                          display: "flex",
+                          gap: "var(--s-2)",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <FollowBadge
+                          label="1h"
+                          entry={a.price}
+                          later={o?.price1h ?? null}
+                          side={a.side}
+                        />
+                        <FollowBadge
+                          label="24h"
+                          entry={a.price}
+                          later={o?.price24h ?? null}
+                          side={a.side}
+                        />
+                        {o?.resolved ? (
+                          <Icon
+                            s={o.won == null ? "➖" : o.won ? "✅" : "❌"}
+                            title={`${iconTip(
+                              o.won == null ? "➖" : o.won ? "✅" : "❌",
+                            )} · 结算价 ${o.resolutionPrice} vs 成交价 ${a.price.toFixed(3)}`}
                           />
-                          <FollowBadge
-                            label="24h"
-                            entry={a.price}
-                            later={o?.price24h ?? null}
-                            side={a.side}
-                          />
-                          {o?.resolved ? (
-                            <Icon
-                              s={o.won == null ? "➖" : o.won ? "✅" : "❌"}
-                              title={`${iconTip(
-                                o.won == null ? "➖" : o.won ? "✅" : "❌",
-                              )} · 结算价 ${o.resolutionPrice}`}
-                            />
-                          ) : null}
-                          {!o ||
-                          (o.price1h == null &&
-                            o.price24h == null &&
-                            !o.resolved) ? (
-                            <span className="muted">…</span>
-                          ) : null}
-                        </span>
-                      )}
+                        ) : null}
+                        {!o ||
+                        (o.price1h == null &&
+                          o.price24h == null &&
+                          !o.resolved) ? (
+                          <span className="muted">…</span>
+                        ) : null}
+                      </span>
                     </td>
                     <td className="mono muted">{fmtTime(a.createdAt)}</td>
                   </tr>

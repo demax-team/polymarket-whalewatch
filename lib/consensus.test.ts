@@ -51,6 +51,9 @@ describe("detectConsensus", () => {
     expect(groups[0].walletCount).toBe(2);
     expect(groups[0].totalNetUsd).toBe(20000);
     expect(groups[0].wallets.map((w) => w.wallet)).toEqual(["0xa", "0xb"]);
+    // Token identity for the validation loop (all members fill the same token).
+    expect(groups[0].asset).toBe("asset1");
+    expect(groups[0].outcomeIndex).toBe(0);
   });
 
   it("nets sells against buys per wallet (a flip-flopper doesn't qualify)", () => {
@@ -167,6 +170,19 @@ describe("runConsensusCycle", () => {
     expect(rows[1].dedup_key).toContain(":3"); // escalation level in the key
   });
 
+  it("stores the token fields the alert_outcomes validation loop needs in the payload", async () => {
+    const db = openDb(":memory:");
+    await runConsensusCycle(deps(db));
+    const row = db
+      .prepare("SELECT payload FROM alerts WHERE type = 'consensus'")
+      .get() as { payload: string };
+    const p = JSON.parse(row.payload) as Record<string, unknown>;
+    expect(p.asset).toBe("asset1");
+    expect(p.outcomeIndex).toBe(0);
+    expect(typeof p.avgBuyPrice).toBe("number");
+    expect(typeof p.lastTs).toBe("number");
+  });
+
   it("re-fires after the state TTL expires (group re-formed = news again)", async () => {
     const db = openDb(":memory:");
     const send = vi.fn().mockResolvedValue(undefined);
@@ -180,12 +196,131 @@ describe("runConsensusCycle", () => {
 
   it("skips everything when the whitelist is empty (no seed yet)", async () => {
     const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const fetchWindow = vi.fn();
     const fired = await runConsensusCycle(
       deps(db, { getSmart: () => new Map(), fetchWindow }),
     );
     expect(fired).toBe(0);
     expect(fetchWindow).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("warns about an empty whitelist at most once an hour", async () => {
+    const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Far beyond any nowSec earlier tests used, so the module-level rate-limit
+    // state can't mask the first warn.
+    const base = 4_000_000_000;
+    const empty = (nowSec: number) =>
+      deps(db, { getSmart: () => new Map(), nowSec });
+    await runConsensusCycle(empty(base));
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("whitelist empty");
+    // Within the hour: silent (the 5-min cadence must not spam the logs).
+    await runConsensusCycle(empty(base + 600));
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    // Past the hour: warns again.
+    await runConsensusCycle(empty(base + 3601));
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
+
+  it("logs window coverage and the qualified-wallet min-fill distribution (pushes untouched)", async () => {
+    const db = openDb(":memory:");
+    const send = vi.fn().mockResolvedValue(undefined);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const nowSec = 100_000;
+    // Truncated fetch that only reached back 3h of the requested 6h window.
+    const fired = await runConsensusCycle(
+      deps(db, {
+        send,
+        nowSec,
+        windowSec: 6 * 3600,
+        fetchWindow: async () => ({
+          trades: [
+            mk({ proxyWallet: "0xA", transactionHash: "0x1" }), // $10k BUY
+            // 0xA's smaller second fill → its min single fill is $6k.
+            mk({
+              proxyWallet: "0xA",
+              transactionHash: "0x1b",
+              size: 12000,
+              price: 0.5,
+            }),
+            mk({ proxyWallet: "0xB", transactionHash: "0x2" }),
+          ],
+          truncated: true,
+          effectiveSinceSec: nowSec - 3 * 3600,
+        }),
+      }),
+    );
+    expect(fired).toBe(1);
+    const lines = logSpy.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("coverage 3.0h/6.0h (50%)"))).toBe(
+      true,
+    );
+    expect(
+      lines.some((l) =>
+        l.includes("qualified-wallet min single fill USD: [6000, 10000]"),
+      ),
+    ).toBe(true);
+    // The pushed message is byte-identical to the format function's output —
+    // the coverage data goes to the logs only.
+    expect(send.mock.calls[0][0] as string).not.toContain("覆盖");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("omits the coverage line when fetchWindow reports no effectiveSinceSec (legacy shape)", async () => {
+    const db = openDb(":memory:");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runConsensusCycle(deps(db, { nowSec: 200_000 }));
+    const lines = logSpy.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("coverage"))).toBe(false);
+    logSpy.mockRestore();
+  });
+
+  it("claim lock: a group recently claimed by another process is not double-pushed", async () => {
+    const db = openDb(":memory:");
+    const send = vi.fn().mockResolvedValue(undefined);
+    // The other process claimed this exact formation moments ago (its alerts
+    // row is RECENT — well within the state TTL).
+    db.prepare(
+      "INSERT INTO alerts (type, dedup_key, payload, created_at) VALUES (?, ?, ?, ?)",
+    ).run("consensus", "consensus:0xc:Yes:2", "{}", 9_990);
+
+    const fired = await runConsensusCycle(deps(db, { send }));
+    expect(fired).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    // State stays untouched — the claiming process owns the update.
+    const state = db
+      .prepare("SELECT COUNT(*) AS c FROM consensus_state")
+      .get() as { c: number };
+    expect(state.c).toBe(0);
+  });
+
+  it("rolls the alerts claim back when send fails, so the group retries", async () => {
+    const db = openDb(":memory:");
+    const failingSend = vi.fn().mockRejectedValue(new Error("telegram down"));
+
+    await expect(
+      runConsensusCycle(deps(db, { send: failingSend })),
+    ).rejects.toThrow("telegram down");
+    // Claim rolled back: no alerts row, no state row.
+    const alerts = db.prepare("SELECT COUNT(*) AS c FROM alerts").get() as {
+      c: number;
+    };
+    expect(alerts.c).toBe(0);
+    const state = db
+      .prepare("SELECT COUNT(*) AS c FROM consensus_state")
+      .get() as { c: number };
+    expect(state.c).toBe(0);
+
+    // Next cycle with a healthy send delivers exactly once.
+    const send = vi.fn().mockResolvedValue(undefined);
+    expect(await runConsensusCycle(deps(db, { send, nowSec: 10_100 }))).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 });
 

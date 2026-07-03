@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import { openDb } from "./db";
-import { runAlertCycle } from "./alertEngine";
+import { MAX_AGE_LOOKUP_CYCLES, runAlertCycle } from "./alertEngine";
 import { DEFAULT_CONDITIONS, type AlertConditions } from "./alertConditions";
 import { dedupKey } from "./trades";
+import { markSeen } from "./seen";
 import type { Trade } from "./types";
 
 // Trade factory. size*price = notional; defaults clear the 10k default minUsd.
@@ -102,24 +103,26 @@ describe("runAlertCycle", () => {
     expect(fired).toBe(1);
   });
 
-  it("(d) age filter drops too-old and unknown-age wallets", async () => {
+  it("(d) age filter drops too-old and verified-empty (null) wallets deterministically", async () => {
     const db = openDb(":memory:");
     const young = mk({ transactionHash: "0xy", proxyWallet: "0xYOUNG" });
     const old = mk({ transactionHash: "0xo", proxyWallet: "0xOLD" });
-    const unknown = mk({ transactionHash: "0xu", proxyWallet: "0xUNKNOWN" });
+    // null = the /activity probe VERIFIED there is no history — a settled
+    // verdict, dropped for good (unlike a FAILED lookup, see test (s)).
+    const empty = mk({ transactionHash: "0xu", proxyWallet: "0xEMPTY" });
     const send = vi.fn().mockResolvedValue(undefined);
 
     const getAges = vi.fn(
       async (_wallets: string[]): Promise<Record<string, number | null>> => ({
         "0xyoung": 3,
         "0xold": 99,
-        "0xunknown": null,
+        "0xempty": null,
       }),
     );
 
     const fired = await runAlertCycle({
       db,
-      fetchTrades: async () => [young, old, unknown],
+      fetchTrades: async () => [young, old, empty],
       conditions: cond({ maxAgeDays: 7, minUsd: 10000 }),
       getAges,
       send,
@@ -131,30 +134,113 @@ describe("runAlertCycle", () => {
     // getAges asked for the distinct lowercased survivor wallets
     expect(getAges).toHaveBeenCalledTimes(1);
     const asked = getAges.mock.calls[0][0];
-    expect(new Set(asked)).toEqual(new Set(["0xyoung", "0xold", "0xunknown"]));
+    expect(new Set(asked)).toEqual(new Set(["0xyoung", "0xold", "0xempty"]));
+    // Deterministic drops ARE swept as seen — they never re-evaluate.
+    const seen = db.prepare("SELECT COUNT(*) AS c FROM seen_trades").get() as {
+      c: number;
+    };
+    expect(seen.c).toBe(3);
   });
 
-  it("(e) timestamp gate drops trades older than minTimestamp", async () => {
+  it("(s) a FAILED age lookup (wallet absent) defers the trade to the next cycle instead of swallowing it", async () => {
+    const db = openDb(":memory:");
+    const t = mk({ transactionHash: "0xagedefer", proxyWallet: "0xNEW" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const ageRetries = new Map<string, number>();
+    const base = {
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000, maxAgeDays: 7 }),
+      send,
+      minTimestamp: 0,
+      ageRetries,
+    };
+
+    // Cycle 1: /activity down → wallet ABSENT from ages → no fire, NOT seen.
+    expect(await runAlertCycle({ ...base, getAges: async () => ({}) })).toBe(0);
+    expect(
+      db
+        .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+        .get(dedupKey(t)),
+    ).toBeUndefined();
+    expect(ageRetries.get(dedupKey(t))).toBe(1);
+
+    // Cycle 2: lookup recovered → the same trade fires normally, ledger clear.
+    expect(
+      await runAlertCycle({ ...base, getAges: async () => ({ "0xnew": 3 }) }),
+    ).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ageRetries.size).toBe(0);
+  });
+
+  it("(t) gives up (marks seen + warns) after MAX_AGE_LOOKUP_CYCLES consecutive failed age lookups", async () => {
+    const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const t = mk({ transactionHash: "0xageforever", proxyWallet: "0xNEW" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const ageRetries = new Map<string, number>();
+    const base = {
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000, maxAgeDays: 7 }),
+      getAges: async () => ({}), // permanently failing lookup
+      send,
+      minTimestamp: 0,
+      ageRetries,
+    };
+
+    // Cycles 1..N-1: deferred (never marked seen, never fired).
+    for (let i = 1; i < MAX_AGE_LOOKUP_CYCLES; i++) {
+      expect(await runAlertCycle(base)).toBe(0);
+      expect(
+        db
+          .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+          .get(dedupKey(t)),
+      ).toBeUndefined();
+      expect(ageRetries.get(dedupKey(t))).toBe(i);
+    }
+    // Cycle N: give up — swept as seen with a warn, ledger entry removed.
+    expect(await runAlertCycle(base)).toBe(0);
+    expect(
+      db
+        .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+        .get(dedupKey(t)),
+    ).toBeDefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("giving up"));
+    expect(ageRetries.size).toBe(0);
+    // Even a later lookup recovery cannot resurrect it (already seen).
+    expect(
+      await runAlertCycle({ ...base, getAges: async () => ({ "0xnew": 3 }) }),
+    ).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("(e) timestamp gate: pre-window trades never fire but are seeded seen once", async () => {
     const db = openDb(":memory:");
     const fresh = mk({ transactionHash: "0xfresh", timestamp: 2000 });
     const stale = mk({ transactionHash: "0xstale", timestamp: 500 });
     const send = vi.fn().mockResolvedValue(undefined);
-
-    const fired = await runAlertCycle({
+    const deps = {
       db,
       fetchTrades: async () => [fresh, stale],
       conditions: cond({ minUsd: 10000 }),
       getAges: noAges,
       send,
       minTimestamp: 1000,
-    });
+    };
 
-    expect(fired).toBe(1);
-    // the stale trade was NOT marked seen (it never passed the timestamp gate)
+    expect(await runAlertCycle(deps)).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1); // only the fresh trade
+    // The stale trade IS marked seen (backlog seed, with its own ts) so the
+    // same historical row isn't re-fetched-and-re-checked every cycle…
     const staleSeen = db
-      .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
-      .get(dedupKey(stale));
-    expect(staleSeen).toBeUndefined();
+      .prepare("SELECT ts FROM seen_trades WHERE dedup_key = ?")
+      .get(dedupKey(stale)) as { ts: number } | undefined;
+    expect(staleSeen?.ts).toBe(500);
+    // …and it still never fires on a later cycle.
+    expect(await runAlertCycle(deps)).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it("(f) disabled conditions fire nothing", async () => {
@@ -258,6 +344,49 @@ describe("runAlertCycle", () => {
     expect(fired2).toBe(0);
   });
 
+  it("(j2) smartOnly logs its hit ratio whenever candidates were evaluated", async () => {
+    const db = openDb(":memory:");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const smartTrade = mk({ transactionHash: "0xs", proxyWallet: "0xSMART" });
+    const plainTrade = mk({ transactionHash: "0xp", proxyWallet: "0xPLAIN" });
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    await runAlertCycle({
+      db,
+      fetchTrades: async () => [smartTrade, plainTrade],
+      conditions: cond({ minUsd: 10000, smartOnly: true }),
+      getAges: noAges,
+      getSmart: () => ({ "0xsmart": { score: 82 } }),
+      send,
+      minTimestamp: 0,
+    });
+    // 1 of the 2 candidates hit the whitelist — SILENCE must be tellable
+    // apart from "filter eats everything" straight from the engine logs.
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("smartOnly: 1/2 candidate trade(s)"),
+    );
+
+    // A cycle with zero candidates (nothing cleared the cheap filters) stays
+    // quiet — no per-cycle log spam at the 4s cadence.
+    logSpy.mockClear();
+    await runAlertCycle({
+      db,
+      fetchTrades: async () => [
+        mk({ transactionHash: "0xtiny", size: 10, price: 0.5 }), // $5
+      ],
+      conditions: cond({ minUsd: 10000, smartOnly: true }),
+      getAges: noAges,
+      getSmart: () => ({}),
+      send,
+      minTimestamp: 0,
+    });
+    const smartLogs = logSpy.mock.calls.filter((c) =>
+      String(c[0]).includes("smartOnly:"),
+    );
+    expect(smartLogs).toHaveLength(0);
+    logSpy.mockRestore();
+  });
+
   it("(k) maxHoursToEnd keeps only pre-settlement trades and enriches the alert", async () => {
     const db = openDb(":memory:");
     const NOW = Math.floor(Date.parse("2026-07-01T00:00:00Z") / 1000);
@@ -333,9 +462,9 @@ describe("runAlertCycle", () => {
       await runAlertCycle({ ...base, getMarketMeta: async () => ({}) }),
     ).toBe(0);
     expect(
-      db.prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?").get(
-        dedupKey(t),
-      ),
+      db
+        .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+        .get(dedupKey(t)),
     ).toBeUndefined();
 
     // Cycle 2: gamma recovered → the same trade fires normally.
@@ -362,6 +491,180 @@ describe("runAlertCycle", () => {
     });
 
     expect(fired).toBe(1);
+    expect(countAlerts(db)).toBe(1);
+  });
+
+  it("(m) claim lock: a trade claimed by another process mid-cycle is not double-pushed", async () => {
+    const db = openDb(":memory:");
+    const t = mk({ transactionHash: "0xrace", proxyWallet: "0xRACE" });
+    const send = vi.fn().mockResolvedValue(undefined);
+    // Simulate the second process winning the race INSIDE our cycle: the age
+    // lookup runs after our batched seen check but before our markSeen claim,
+    // so marking the trade seen here lands exactly in the contested window.
+    const getAges = async (): Promise<Record<string, number | null>> => {
+      markSeen(db, dedupKey(t), t.timestamp);
+      return { "0xrace": 1 };
+    };
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000, maxAgeDays: 7 }),
+      getAges,
+      send,
+      minTimestamp: 0,
+    });
+
+    expect(fired).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    // The claiming process records the alert row, not us.
+    expect(countAlerts(db)).toBe(0);
+  });
+
+  it("(o) cooldown: a same-cycle (wallet,market) burst pushes ONE message with the ×N summary, all recorded", async () => {
+    const db = openDb(":memory:");
+    const t1 = mk({ transactionHash: "0xb1", timestamp: 1000 });
+    const t2 = mk({ transactionHash: "0xb2", timestamp: 1001 });
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    const fired = await runAlertCycle({
+      db,
+      fetchTrades: async () => [t1, t2],
+      conditions: cond({ minUsd: 10000, cooldownMinutes: 30 }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+      nowSec: 1001,
+    });
+
+    // Both matches are real alerts (recorded), only the first one pushes.
+    expect(fired).toBe(2);
+    expect(countAlerts(db)).toBe(2);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0] as string).toContain("共 2 笔");
+  });
+
+  it("(p) cooldown: a later cycle inside the window records without pushing; past the window it pushes again", async () => {
+    const db = openDb(":memory:");
+    const send = vi.fn().mockResolvedValue(undefined);
+    const base = {
+      db,
+      conditions: cond({ minUsd: 10000, cooldownMinutes: 30 }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+    };
+
+    // Cycle 1: pushes (no burst → no summary suffix).
+    await runAlertCycle({
+      ...base,
+      fetchTrades: async () => [
+        mk({ transactionHash: "0xc1", timestamp: 1000 }),
+      ],
+      nowSec: 1000,
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0] as string).not.toContain("共 1 笔");
+
+    // Cycle 2, 10 min later: same wallet+market → record-only.
+    const fired2 = await runAlertCycle({
+      ...base,
+      fetchTrades: async () => [
+        mk({ transactionHash: "0xc2", timestamp: 1600 }),
+      ],
+      nowSec: 1600,
+    });
+    expect(fired2).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(countAlerts(db)).toBe(2);
+
+    // Cycle 3, past the 30-min window (measured from the LAST recorded alert):
+    // pushes again.
+    await runAlertCycle({
+      ...base,
+      fetchTrades: async () => [
+        mk({ transactionHash: "0xc3", timestamp: 1600 + 1801 }),
+      ],
+      nowSec: 1600 + 1801,
+    });
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(countAlerts(db)).toBe(3);
+  });
+
+  it("(q) cooldown scopes by (wallet,market): other wallets / markets still push", async () => {
+    const db = openDb(":memory:");
+    const send = vi.fn().mockResolvedValue(undefined);
+    const t1 = mk({ transactionHash: "0xq1", timestamp: 1000 });
+    const otherWallet = mk({
+      transactionHash: "0xq2",
+      proxyWallet: "0xOTHER",
+      timestamp: 1001,
+    });
+    const otherMarket = mk({
+      transactionHash: "0xq3",
+      conditionId: "0xc2",
+      timestamp: 1002,
+    });
+
+    await runAlertCycle({
+      db,
+      fetchTrades: async () => [t1, otherWallet, otherMarket],
+      conditions: cond({ minUsd: 10000, cooldownMinutes: 30 }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+      nowSec: 1002,
+    });
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it("(r) cooldownMinutes=0 disables suppression entirely", async () => {
+    const db = openDb(":memory:");
+    const send = vi.fn().mockResolvedValue(undefined);
+    const t1 = mk({ transactionHash: "0xz1", timestamp: 1000 });
+    const t2 = mk({ transactionHash: "0xz2", timestamp: 1001 });
+
+    await runAlertCycle({
+      db,
+      fetchTrades: async () => [t1, t2],
+      conditions: cond({ minUsd: 10000, cooldownMinutes: 0 }),
+      getAges: noAges,
+      send,
+      minTimestamp: 0,
+      nowSec: 1001,
+    });
+    expect(send).toHaveBeenCalledTimes(2);
+    const sent = send.mock.calls.map((c) => c[0] as string);
+    expect(sent.some((m) => m.includes("共"))).toBe(false);
+  });
+
+  it("(n) send failure rolls the claim back so the trade retries next cycle", async () => {
+    const db = openDb(":memory:");
+    const t = mk({ transactionHash: "0xretry" });
+    const failingSend = vi.fn().mockRejectedValue(new Error("telegram 500"));
+    const base = {
+      db,
+      fetchTrades: async () => [t],
+      conditions: cond({ minUsd: 10000 }),
+      getAges: noAges,
+      minTimestamp: 0,
+    };
+
+    await expect(runAlertCycle({ ...base, send: failingSend })).rejects.toThrow(
+      "telegram 500",
+    );
+    // Claim rolled back: not seen, no alert row.
+    expect(
+      db
+        .prepare("SELECT 1 FROM seen_trades WHERE dedup_key = ?")
+        .get(dedupKey(t)),
+    ).toBeUndefined();
+    expect(countAlerts(db)).toBe(0);
+
+    // Next cycle with a healthy send delivers exactly once.
+    const send = vi.fn().mockResolvedValue(undefined);
+    expect(await runAlertCycle({ ...base, send })).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
     expect(countAlerts(db)).toBe(1);
   });
 });

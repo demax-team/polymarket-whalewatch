@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { DB } from "./db";
+import { fetchWithRetry } from "./fetchWithRetry";
 import { mapLimit } from "./mapLimit";
 
 const DATA_API = "https://data-api.polymarket.com";
@@ -33,17 +34,53 @@ export async function fetchClosedPositions(
 ): Promise<{ positions: ClosedPosition[]; truncated: boolean }> {
   const { maxPages = 8 } = opts;
   const positions: ClosedPosition[] = [];
+  // Duplicate-page guard, same defensive posture as fetchLeaderboard's
+  // wallet-level dedup: if the API ever re-serves rows we already collected
+  // (deep offsets being silently clamped is a verified data-api behavior on
+  // the leaderboard), an all-duplicate page means no forward progress —
+  // appending it would double-count positions into the win rate. Fingerprints
+  // come from the RAW rows (conditionId + asset): the parsed shape keeps only
+  // three numeric fields, nowhere near unique.
+  const seenFp = new Set<string>();
   for (let page = 0; page < maxPages; page++) {
     const url = `${DATA_API}/closed-positions?user=${encodeURIComponent(wallet)}&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`;
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(8000),
+    // Shared transient-5xx retry; a still-failing page throws as before (the
+    // walletStats caller treats a throw as "uncached, retry next call").
+    const res = await fetchWithRetry(url, {
+      timeoutMs: 8000,
       headers: { "User-Agent": "polymarket-monitor" },
+      label: "fetchClosedPositions",
     });
     if (!res.ok) throw new Error(`fetchClosedPositions ${res.status}`);
     const raw = await res.json();
     if (!Array.isArray(raw) || raw.length === 0) {
       return { positions, truncated: false };
     }
+    let fresh = 0;
+    const pageFps: string[] = [];
+    for (const row of raw) {
+      const r = row as Record<string, unknown> | null;
+      const cid = r?.conditionId;
+      const asset = r?.asset;
+      // Rows without identity fields can't be fingerprinted — count them as
+      // fresh so an upstream schema change can never falsely trip the guard.
+      if (cid == null && asset == null) {
+        fresh++;
+        continue;
+      }
+      const fp = `${String(cid)}|${String(asset)}`;
+      if (!seenFp.has(fp)) fresh++;
+      pageFps.push(fp);
+    }
+    if (fresh === 0) {
+      // Entire page already seen: drop it (appending would double-count) and
+      // stop as truncated — older positions exist but are unreachable.
+      console.warn(
+        `[fetchClosedPositions] ${wallet} page ${page} re-served already-seen positions — stopping, treating as truncated`,
+      );
+      return { positions, truncated: true };
+    }
+    for (const fp of pageFps) seenFp.add(fp);
     for (const row of raw) {
       const parsed = ClosedPositionSchema.safeParse(row);
       if (parsed.success) positions.push(parsed.data);
@@ -151,10 +188,18 @@ async function fetchWalletStats(wallet: string): Promise<WalletStats> {
 
 const DEFAULT_TTL_SEC = 86_400; // track records move slowly; a day is fresh enough
 
+// In-flight dedup across concurrent calls (same pattern as walletAge): a
+// wallet page and the daily seed enriching the same cold wallet would each
+// pull up to 8 /closed-positions pages, with the loser's INSERT OR REPLACE
+// overwriting the winner's for no gain. Keyed by lowercased wallet; entries
+// drop once settled so failures retry next call.
+const inFlightStats = new Map<string, Promise<WalletStats>>();
+
 // Returns wallet(lowercased) -> WalletStats|null. SQLite-cached with a TTL
 // (unlike wallet_age, a track record CHANGES as markets settle, so entries
 // expire). Errors return null and stay uncached so the next call retries.
-// `fetcher` is injectable for tests.
+// Concurrent calls share one in-flight fetch per wallet. `fetcher`/`inFlight`
+// are injectable for tests.
 export async function getWalletStats(
   db: DB,
   wallets: string[],
@@ -163,6 +208,7 @@ export async function getWalletStats(
     ttlSec?: number;
     fetcher?: (w: string) => Promise<WalletStats>;
     nowSec?: number;
+    inFlight?: Map<string, Promise<WalletStats>>;
   } = {},
 ): Promise<Record<string, WalletStats | null>> {
   const {
@@ -170,6 +216,7 @@ export async function getWalletStats(
     ttlSec = DEFAULT_TTL_SEC,
     fetcher = fetchWalletStats,
     nowSec = Math.floor(Date.now() / 1000),
+    inFlight = inFlightStats,
   } = opts;
   const distinct = [...new Set(wallets.map((w) => w.toLowerCase()))];
   const sel = db.prepare(
@@ -206,8 +253,16 @@ export async function getWalletStats(
     }
   }
   const fetched = await mapLimit(misses, concurrency, async (w) => {
+    let p = inFlight.get(w);
+    if (!p) {
+      p = fetcher(w);
+      inFlight.set(w, p);
+      // Settle-time cleanup; the leading catch keeps a rejected fetch from
+      // surfacing as unhandled here (every awaiter handles it below).
+      p.catch(() => {}).finally(() => inFlight.delete(w));
+    }
     try {
-      return await fetcher(w);
+      return await p;
     } catch (e) {
       console.warn(`[walletStats] fetch failed for ${w}:`, e);
       return null;

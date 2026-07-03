@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { getSmartPoolStatus } from "../../../lib/smartWallets";
 
 // Node runtime is required: better-sqlite3 is a native module and cannot run on
 // the Edge runtime. force-dynamic disables caching so each poll reads fresh rows.
@@ -55,11 +56,13 @@ export async function GET() {
         .all() as AlertRow[];
 
       const alerts: AlertView[] = rows.map((row) => {
-        let p: TradePayload & { totalNetUsd?: number } = {};
+        let p: TradePayload & { totalNetUsd?: number; avgBuyPrice?: number } =
+          {};
         try {
           p = row.payload
             ? (JSON.parse(row.payload) as TradePayload & {
                 totalNetUsd?: number;
+                avgBuyPrice?: number;
               })
             : {};
         } catch {
@@ -75,7 +78,9 @@ export async function GET() {
             outcome: p.outcome ?? "",
             side: "BUY",
             usd: typeof p.totalNetUsd === "number" ? p.totalNetUsd : 0,
-            price: 0,
+            // The group's usd-weighted average buy price — the "entry" that
+            // the validation loop and follow-through badges measure against.
+            price: typeof p.avgBuyPrice === "number" ? p.avgBuyPrice : 0,
             wallet: "",
             eventSlug: p.eventSlug ?? "",
             txHash: "",
@@ -99,13 +104,22 @@ export async function GET() {
         };
       });
 
-      return Response.json({ count: alerts.length, alerts });
+      // smartOnly feedback for the ConditionsPanel: whitelist size + 24h 🏆
+      // alert count (each null when its table is missing — see the helper).
+      const pool = getSmartPoolStatus(db);
+
+      return Response.json({ count: alerts.length, alerts, ...pool });
     } finally {
       db.close();
     }
   } catch (error) {
     // Missing db / missing table / parse issues degrade gracefully to empty.
     console.error("[/api/alerts] failed to read alerts:", error);
-    return Response.json({ count: 0, alerts: [] });
+    return Response.json({
+      count: 0,
+      alerts: [],
+      smartWalletCount: null,
+      smartAlerts24h: null,
+    });
   }
 }

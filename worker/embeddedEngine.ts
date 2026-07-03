@@ -1,6 +1,8 @@
 import { parseConfig } from "../lib/config";
 import { openDb, type DB } from "../lib/db";
 import { getLargeTrades, getTradesWindowDeep } from "../lib/polymarket";
+import { maybePruneSeen, seenKeySet } from "../lib/seen";
+import { dedupKey } from "../lib/trades";
 import { sendMessage } from "../lib/telegram";
 import { getWalletAges } from "../lib/walletAge";
 import { getAlertConditions } from "../lib/alertConditions";
@@ -16,12 +18,32 @@ import { runConsensusCycle } from "../lib/consensus";
 // Guarded singleton PER PROCESS: instrumentation may call this more than once
 // within a runtime, and the flag makes repeat calls no-ops. It does NOT guard
 // across processes — running the Next app AND `npm run worker` concurrently
-// gives two engines on the same db. Alert rows stay deduped either way (unique
-// (type, dedup_key) index + INSERT OR IGNORE), but Telegram pushes may rarely
-// double up in that setup; prefer running one or the other.
+// gives two engines on the same db. Alert rows stay deduped (unique
+// (type, dedup_key) index + INSERT OR IGNORE) and Telegram pushes are
+// claim-locked (claim-then-send in runAlertCycle / runConsensusCycle), so the
+// two-process setup no longer double-pushes — only consensus TTL reminders can
+// still rarely overlap; prefer running one or the other regardless.
 let started = false;
 
 const SECONDS_PER_DAY = 86400;
+
+// Startup backfill cap: on restart we resume from the last seen trade, but
+// never further back than this — a long-dead engine must not replay hours of
+// history (the single /trades page wouldn't reach much deeper anyway).
+const BACKFILL_CAP_SEC = 30 * 60;
+
+// Startup replay boundary. Resume from the newest seen_trades.ts so a restart/
+// deploy gap is backfilled instead of becoming a permanent blind window;
+// clamped to [now - capSec, now] (cap long outages, ignore future ts from
+// clock skew). A cold db (no seen rows) starts at "now" — no historical storm.
+export function computeMinTimestamp(
+  maxSeenTs: number | null,
+  nowSec: number,
+  capSec: number,
+): number {
+  if (maxSeenTs == null) return nowSec;
+  return Math.min(nowSec, Math.max(maxSeenTs, nowSec - capSec));
+}
 
 /**
  * Start the continuously-running alert engine.
@@ -30,7 +52,9 @@ const SECONDS_PER_DAY = 86400;
  *   `data.sqlite`, overridable via DASH_DB so engine + dashboard always agree).
  * - Telegram is OPTIONAL: push only when both creds are set (telegramEnabled);
  *   otherwise matches are still recorded to the `alerts` table.
- * - minTimestamp = now at startup, so we never replay historical backlog.
+ * - minTimestamp resumes from MAX(seen_trades.ts) capped at BACKFILL_CAP_SEC
+ *   (see computeMinTimestamp): restart gaps are backfilled, deep history and
+ *   cold-db starts are not replayed.
  * - Reads conditions fresh from the `config` table every cycle, so dashboard
  *   edits take effect on the next poll.
  */
@@ -48,11 +72,30 @@ export function startAlertEngine(): void {
   const send = cfg.telegramEnabled
     ? (html: string) => sendMessage(creds, html)
     : undefined;
-  // Only alert on trades that arrive AFTER the engine starts (no historical storm).
-  const minTimestamp = Math.floor(Date.now() / 1000);
+  // Backfill window: resume from the last seen trade (bounded by the cap) so a
+  // restart/deploy gap no longer permanently swallows the trades that landed
+  // during the downtime. The pre-window backlog is seeded as seen by the first
+  // runAlertCycle, so the window only ever replays forward.
+  const nowStartSec = Math.floor(Date.now() / 1000);
+  const maxSeenTs = (
+    db.prepare("SELECT MAX(ts) AS ts FROM seen_trades").get() as {
+      ts: number | null;
+    }
+  ).ts;
+  const minTimestamp = computeMinTimestamp(
+    maxSeenTs,
+    nowStartSec,
+    BACKFILL_CAP_SEC,
+  );
+  console.log(
+    `[engine] backfill window ${((nowStartSec - minTimestamp) / 60).toFixed(1)} min` +
+      ` (maxSeenTs=${maxSeenTs ?? "none — cold db"}, minTimestamp=${minTimestamp}, cap=${BACKFILL_CAP_SEC / 60}min)`,
+  );
 
-  // walletAge.getWalletAges returns firstActivityTs (unix sec) | null per wallet.
-  // The engine needs ageDays, so convert here.
+  // walletAge.getWalletAges returns firstActivityTs (unix sec) | null per
+  // wallet, with FAILED lookups ABSENT from the map. The engine needs ageDays,
+  // so convert here; absent wallets stay absent (Object.entries skips them) so
+  // runAlertCycle can defer those trades instead of dropping them for good.
   const getAges = async (
     wallets: string[],
   ): Promise<Record<string, number | null>> => {
@@ -74,10 +117,31 @@ export function startAlertEngine(): void {
   // the exact (higher) minUsd in memory. The floor never EXCEEDS minUsd, so a
   // low-threshold config (e.g. $500) still sees its trades.
   const SAFE_FLOOR = 10_000;
+  // Steady-state page size, downshifted from the old single 1000-row page: on
+  // a 4s cadence the page is overwhelmingly already-seen rows, so 250 cuts
+  // ~75% of the per-cycle bandwidth/parse cost. A genuinely hot cycle (a full
+  // page of entirely-unseen in-window rows) tops up with offset pages back to
+  // the old 1000-row depth instead of silently dropping the overflow.
+  const POLL_PAGE_LIMIT = 250;
+  const POLL_MAX_PAGES = 4; // 4 × 250 = the previous single-page depth
   // `conditions` is read fresh each cycle, so fetchTrades must take the floor as
   // an argument rather than closing over a startup value.
   const fetchTrades = (minUsd: number) =>
-    getLargeTrades(Math.min(minUsd, SAFE_FLOOR), 1000);
+    getLargeTrades(Math.min(minUsd, SAFE_FLOOR), POLL_PAGE_LIMIT, {
+      // Stop paginating at the startup backfill boundary — deeper rows are
+      // pre-window backlog runAlertCycle would drop anyway.
+      sinceSec: minTimestamp,
+      maxPages: POLL_MAX_PAGES,
+      // Batched seen probe, one indexed IN(...) query per full page (the
+      // all-time feed always fills page 0, so this runs ~once per cycle —
+      // sub-ms): once a page touches already-processed trades, deeper pages
+      // are old news and the top-up stops.
+      hasSeenAny: (rows) =>
+        seenKeySet(
+          db,
+          rows.map((t) => dedupKey(t)),
+        ).size > 0,
+    });
 
   console.log(
     `[engine] starting · db=${dbPath} · telegram=${
@@ -97,6 +161,13 @@ export function startAlertEngine(): void {
           ),
         )
         .catch((e) => console.error("[engine] smart-wallet seed failed", e));
+
+      // Daily seen_trades retention prune (synchronous, day-gated, sub-ms on
+      // the steady-state table): the dedup ledger otherwise grows without
+      // bound and every seenKeySet IN(...) probe and startup MAX(ts) scan
+      // pays for it. 7d retention dwarfs every fetch window (see
+      // maybePruneSeen), so this can never resurrect a duplicate alert.
+      maybePruneSeen(db);
 
       const conditions = getAlertConditions(db);
       const fired = await runAlertCycle({
@@ -138,6 +209,9 @@ export function startAlertEngine(): void {
           }),
         getSmart: () => getAllSmartTags(db),
         send,
+        // Coverage-log denominator: fetchWindow's effectiveSinceSec is
+        // measured against this requested window.
+        windowSec: CONSENSUS_WINDOW_SEC,
       });
       if (fired > 0) {
         console.log(`[engine] consensus cycle fired ${fired} alert(s)`);

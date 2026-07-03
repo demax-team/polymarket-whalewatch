@@ -93,18 +93,81 @@ describe("getWalletAges", () => {
     expect(fetcher).toHaveBeenCalledTimes(10);
   });
 
-  it("returns null for a fetcher that throws and does NOT cache it (next call retries)", async () => {
+  it("leaves a throwing fetcher's wallet ABSENT (not null) and uncached, so the next call retries", async () => {
     const db = openDb(":memory:");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const fetcher = vi
       .fn<(w: string) => Promise<number | null>>()
       .mockRejectedValueOnce(new Error("boom"))
       .mockResolvedValueOnce(1700000000);
     const first = await getWalletAges(db, ["0xAAA"], { fetcher });
-    expect(first).toEqual({ "0xaaa": null });
+    // Failed lookup ≠ verified-empty: the wallet is ABSENT, not null, so
+    // callers (e.g. the alert engine) can defer instead of dropping for good.
+    expect(first).toEqual({});
+    expect(
+      db.prepare("SELECT 1 FROM wallet_age WHERE wallet = ?").get("0xaaa"),
+    ).toBeUndefined();
     // Not cached → a retry actually re-invokes the fetcher and now resolves.
     const second = await getWalletAges(db, ["0xAAA"], { fetcher });
     expect(second).toEqual({ "0xaaa": 1700000000 });
     expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("lookup failed"),
+      expect.anything(),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("caches a verified-empty (null) result on a short TTL: reused while fresh, re-probed once stale", async () => {
+    const db = openDb(":memory:");
+    const fetcher = vi
+      .fn<(w: string) => Promise<number | null>>()
+      .mockResolvedValueOnce(null) // verified: genuinely no activity
+      .mockResolvedValueOnce(1700000000); // …later the wallet turns real
+    const first = await getWalletAges(db, ["0xAAA"], {
+      fetcher,
+      nowSec: 1000,
+    });
+    expect(first).toEqual({ "0xaaa": null });
+    // Persisted as a first_ts=NULL row (previously never written at all).
+    const row = db
+      .prepare("SELECT first_ts, fetched_at FROM wallet_age WHERE wallet = ?")
+      .get("0xaaa") as { first_ts: number | null; fetched_at: number };
+    expect(row).toEqual({ first_ts: null, fetched_at: 1000 });
+    // Inside the 1h TTL: served from SQLite, no re-probe.
+    const second = await getWalletAges(db, ["0xAAA"], {
+      fetcher,
+      nowSec: 1000 + 3599,
+    });
+    expect(second).toEqual({ "0xaaa": null });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    // Past the TTL: re-probed, and the now-real first_ts replaces the row.
+    const third = await getWalletAges(db, ["0xAAA"], {
+      fetcher,
+      nowSec: 1000 + 3600,
+    });
+    expect(third).toEqual({ "0xaaa": 1700000000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("dedupes concurrent lookups for the same wallet via the in-flight map", async () => {
+    const db1 = openDb(":memory:");
+    const db2 = openDb(":memory:");
+    let release!: (v: number) => void;
+    const gate = new Promise<number>((r) => (release = r));
+    const fetcher = vi.fn((_w: string) => gate);
+    const inFlight = new Map<string, Promise<number | null>>();
+    // Two overlapping calls (alert cycle + wallet page) miss their caches
+    // simultaneously — the second must JOIN the first's fetch, not start one.
+    const p1 = getWalletAges(db1, ["0xAAA"], { fetcher, inFlight });
+    const p2 = getWalletAges(db2, ["0xAAA"], { fetcher, inFlight });
+    release(1700000000);
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toEqual({ "0xaaa": 1700000000 });
+    expect(r2).toEqual({ "0xaaa": 1700000000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    // Entry removed on settle so a later call fetches fresh (here: cache hit).
+    expect(inFlight.size).toBe(0);
   });
 
   it("caches a successful null-free lookup so a real first_ts persists across calls", async () => {

@@ -163,12 +163,65 @@ describe("fetchClosedPositions", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("stops as truncated when a page re-serves already-seen positions", async () => {
+    // Fingerprints come from the raw rows' conditionId+asset; the second page
+    // re-serving the SAME rows (offset clamping) must not double-count them.
+    const fullPage = Array.from({ length: 50 }, (_, i) => ({
+      ...pos(1),
+      conditionId: `c${i}`,
+      asset: `a${i}`,
+    }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => fullPage })
+      .mockResolvedValueOnce({ ok: true, json: async () => fullPage });
+    vi.stubGlobal("fetch", fetchMock);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { positions, truncated } = await fetchClosedPositions("0xabc");
+    expect(positions).toHaveLength(50); // repeated page dropped, not appended
+    expect(truncated).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    warnSpy.mockRestore();
+  });
+
+  it("a partially-fresh page still appends in full (guard only trips on ZERO progress)", async () => {
+    const mk = (i: number) => ({ ...pos(1), conditionId: `c${i}`, asset: "a" });
+    const page0 = Array.from({ length: 50 }, (_, i) => mk(i));
+    // Page 1 overlaps page 0 by one row but brings fresh rows — legit data.
+    const page1 = [mk(49), mk(50), mk(51)];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => page0 })
+      .mockResolvedValueOnce({ ok: true, json: async () => page1 });
+    vi.stubGlobal("fetch", fetchMock);
+    const { positions, truncated } = await fetchClosedPositions("0xabc");
+    expect(positions).toHaveLength(53);
+    expect(truncated).toBe(false); // short page = genuine end
+  });
+
   it("throws on a non-ok response", async () => {
+    // Non-transient status: no retry, immediate throw (persistent transient
+    // 5xx exhaustion is covered by the fetchWithRetry tests).
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue({ ok: false, status: 500 }),
+      vi.fn().mockResolvedValue({ ok: false, status: 404 }),
     );
-    await expect(fetchClosedPositions("0xabc")).rejects.toThrow("500");
+    await expect(fetchClosedPositions("0xabc")).rejects.toThrow("404");
+  });
+
+  it("retries a transient 5xx page then succeeds", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 502 })
+      .mockResolvedValueOnce({ ok: true, json: async () => [pos(1)] });
+    vi.stubGlobal("fetch", fetchMock);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { positions, truncated } = await fetchClosedPositions("0xabc");
+    expect(positions).toHaveLength(1);
+    expect(truncated).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
   });
 });
 
@@ -221,6 +274,27 @@ describe("getWalletStats", () => {
     expect(second["0xaaa"]).toEqual(stats());
     expect(fetcher).toHaveBeenCalledTimes(2);
     warnSpy.mockRestore();
+  });
+
+  it("dedupes concurrent lookups for the same wallet via the in-flight map", async () => {
+    const db1 = openDb(":memory:");
+    const db2 = openDb(":memory:");
+    let release!: (v: WalletStats) => void;
+    const gate = new Promise<WalletStats>((r) => (release = r));
+    const fetcher = vi.fn((_w: string) => gate);
+    const inFlight = new Map<string, Promise<WalletStats>>();
+    // Two overlapping calls (wallet page + daily seed enrichment) miss their
+    // caches simultaneously — the second must JOIN the first's fetch (up to 8
+    // /closed-positions pages), not start its own.
+    const p1 = getWalletStats(db1, ["0xAAA"], { fetcher, inFlight });
+    const p2 = getWalletStats(db2, ["0xAAA"], { fetcher, inFlight });
+    release(stats());
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1["0xaaa"]).toEqual(stats());
+    expect(r2["0xaaa"]).toEqual(stats());
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    // Entry removed on settle so a later cold call fetches fresh.
+    expect(inFlight.size).toBe(0);
   });
 
   it("preserves null winRate/roi through the cache round-trip", async () => {

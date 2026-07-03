@@ -19,6 +19,11 @@ export interface ConsensusGroup {
   outcome: string;
   title: string;
   eventSlug: string;
+  // Token identity for the alert_outcomes validation loop: every member trade
+  // of a (conditionId, outcome) group fills the SAME token, so any member's
+  // asset/outcomeIndex identify the group's token.
+  asset: string;
+  outcomeIndex: number;
   wallets: ConsensusWallet[]; // qualified only, sorted by netUsd desc
   walletCount: number;
   totalNetUsd: number;
@@ -64,6 +69,8 @@ export function detectConsensus(
       outcome: string;
       title: string;
       eventSlug: string;
+      asset: string;
+      outcomeIndex: number;
       firstTs: number;
       lastTs: number;
       byWallet: Map<string, Acc>;
@@ -83,6 +90,8 @@ export function detectConsensus(
         outcome: t.outcome,
         title: t.title,
         eventSlug: t.eventSlug,
+        asset: t.asset,
+        outcomeIndex: t.outcomeIndex,
         firstTs: t.timestamp,
         lastTs: t.timestamp,
         byWallet: new Map(),
@@ -132,6 +141,8 @@ export function detectConsensus(
       outcome: g.outcome,
       title: g.title,
       eventSlug: g.eventSlug,
+      asset: g.asset,
+      outcomeIndex: g.outcomeIndex,
       wallets: qualified,
       walletCount: qualified.length,
       totalNetUsd,
@@ -171,7 +182,14 @@ export function formatConsensusAlert(g: ConsensusGroup): string {
 
 export interface ConsensusCycleDeps {
   db: DB;
-  fetchWindow: () => Promise<{ trades: Trade[]; truncated: boolean }>;
+  // effectiveSinceSec (when provided — getTradesWindowDeep always returns it)
+  // is the REAL start of the complete merged window, used purely for the
+  // coverage log below; pushes are untouched.
+  fetchWindow: () => Promise<{
+    trades: Trade[];
+    truncated: boolean;
+    effectiveSinceSec?: number;
+  }>;
   getSmart: () => Map<string, SmartTag>;
   send?: (html: string) => Promise<void>;
   opts?: ConsensusOptions;
@@ -179,8 +197,17 @@ export interface ConsensusCycleDeps {
   // and a re-formation counts as NEWS again (also acts as a periodic reminder
   // for a persistently-held consensus).
   stateTtlSec?: number;
+  // Requested window length (sec) — denominator of the coverage log.
+  windowSec?: number;
   nowSec?: number;
 }
+
+// With an empty whitelist every consensus cycle silently no-ops on a 5-min
+// cadence — an all-day-blank pool (seed never ran, or failed and is pending
+// retry) would be indistinguishable from "no signal". Warn hourly, not per
+// cycle, so the cause is diagnosable from the logs without spamming them.
+const EMPTY_WHITELIST_WARN_INTERVAL_SEC = 3600;
+let lastEmptyWhitelistWarnTs = -Infinity;
 
 /**
  * One consensus detection cycle. Fires an alert when a group FORMS or grows to
@@ -197,21 +224,71 @@ export async function runConsensusCycle(
     send,
     opts = DEFAULT_CONSENSUS,
     stateTtlSec = 6 * 3600,
+    windowSec = 6 * 3600,
     nowSec = Math.floor(Date.now() / 1000),
   } = deps;
   const smartTags = getSmart();
-  if (smartTags.size === 0) return 0; // whitelist not seeded yet
-  const { trades, truncated } = await fetchWindow();
+  if (smartTags.size === 0) {
+    // Whitelist not seeded yet (or the daily seed failed — see maybeDailySeed
+    // retry markers in the same logs).
+    if (
+      nowSec - lastEmptyWhitelistWarnTs >=
+      EMPTY_WHITELIST_WARN_INTERVAL_SEC
+    ) {
+      lastEmptyWhitelistWarnTs = nowSec;
+      console.warn(
+        "[consensus] whitelist empty — smart-wallet seed has not completed (or failed); consensus detection is idle",
+      );
+    }
+    return 0;
+  }
+  const { trades, truncated, effectiveSinceSec } = await fetchWindow();
+  // Window-coverage quantification (observability only — pushes untouched):
+  // row count + real coverage vs the requested window, every cycle. A week of
+  // these lines is the data needed to decide whether the $2k fetch floor has
+  // depth headroom to drop to $1k (coverage consistently >80%) or is already
+  // depth-bound at the current floor.
+  if (effectiveSinceSec != null) {
+    const coveredSec = Math.max(0, nowSec - effectiveSinceSec);
+    const pct = Math.min(100, Math.round((coveredSec / windowSec) * 100));
+    console.log(
+      `[consensus] window: ${trades.length} rows · coverage ${(coveredSec / 3600).toFixed(1)}h/${(windowSec / 3600).toFixed(1)}h (${pct}%) · truncated=${truncated}`,
+    );
+  }
   if (truncated) {
-    // Newest-first pagination hit its page cap: the fetched prefix is still a
-    // complete, self-consistent (shorter) window, but early SELL legs beyond
-    // it are missing — netUsd for long-running accumulators may be overstated.
+    // The deep fetch trims BOTH sides to the newest truncation edge (see
+    // getTradesWindowDeep), so the rows form a complete-but-SHORTER window:
+    // netting inside it is honest; signals older than effectiveSinceSec are
+    // simply not visible this cycle.
     console.warn(
       `[consensus] window truncated at the page cap (${trades.length} rows) — detection runs on the shortened window`,
     );
   }
   const groups = detectConsensus(trades, smartTags, opts);
   if (groups.length === 0) return 0;
+  // Per qualified wallet: the smallest single visible BUY fill (lower bound —
+  // fills under the fetch floor are invisible). Minima hugging the floor mean
+  // the wallet's real chunks are likely smaller and the floor is masking them
+  // ($2k fetch floor vs $5k/wallet qualification mismatch).
+  {
+    const qualified = new Set<string>();
+    for (const g of groups) for (const w of g.wallets) qualified.add(w.wallet);
+    const minFill = new Map<string, number>();
+    for (const t of trades) {
+      if (t.side !== "BUY") continue;
+      const w = t.proxyWallet.toLowerCase();
+      if (!qualified.has(w)) continue;
+      const usdVal = notionalUsd(t);
+      const prev = minFill.get(w);
+      if (prev == null || usdVal < prev) minFill.set(w, usdVal);
+    }
+    const dist = [...minFill.values()]
+      .map((v) => Math.round(v))
+      .sort((a, b) => a - b);
+    console.log(
+      `[consensus] ${groups.length} group(s) · qualified-wallet min single fill USD: [${dist.join(", ")}]`,
+    );
+  }
 
   const sel = db.prepare(
     "SELECT wallet_count, last_alert_ts FROM consensus_state WHERE condition_id = ? AND outcome = ?",
@@ -220,6 +297,15 @@ export async function runConsensusCycle(
     `INSERT OR REPLACE INTO consensus_state (condition_id, outcome, wallet_count, total_usd, last_alert_ts)
      VALUES (?, ?, ?, ?, ?)`,
   );
+  const insAlert = db.prepare(
+    "INSERT OR IGNORE INTO alerts (type, dedup_key, payload, created_at) VALUES (?, ?, ?, ?)",
+  );
+  const selAlert = db.prepare(
+    "SELECT created_at FROM alerts WHERE type = 'consensus' AND dedup_key = ?",
+  );
+  const delAlert = db.prepare(
+    "DELETE FROM alerts WHERE type = 'consensus' AND dedup_key = ?",
+  );
   let fired = 0;
   for (const g of groups) {
     const row = sel.get(g.conditionId, g.outcome) as
@@ -227,15 +313,37 @@ export async function runConsensusCycle(
     const expired = row ? nowSec - row.last_alert_ts > stateTtlSec : false;
     const isNews = !row || expired || g.walletCount > row.wallet_count;
     if (!isNews) continue;
-    if (send) await send(formatConsensusAlert(g));
-    db.prepare(
-      "INSERT OR IGNORE INTO alerts (type, dedup_key, payload, created_at) VALUES (?, ?, ?, ?)",
-    ).run(
-      "consensus",
-      `consensus:${g.conditionId}:${g.outcome}:${g.walletCount}`,
-      JSON.stringify(g),
-      nowSec,
-    );
+    const dk = `consensus:${g.conditionId}:${g.outcome}:${g.walletCount}`;
+    // Claim-then-send: the unique (type, dedup_key) index makes this INSERT a
+    // cross-process preemption lock (embedded engine + standalone worker on
+    // one db). changes === 0 means the row already exists — two very
+    // different cases:
+    //  (a) a RECENT row: the other process claimed this exact formation/
+    //      escalation moments ago and owns the push + state update → skip;
+    //  (b) an OLD row (> stateTtlSec): that is OUR OWN original alert and this
+    //      is the TTL-expiry reminder — no new alerts row (matches the old OR
+    //      IGNORE semantics), push proceeds. Reminder pushes are the one path
+    //      two processes can still rarely both take.
+    const claimed =
+      insAlert.run("consensus", dk, JSON.stringify(g), nowSec).changes === 1;
+    if (!claimed) {
+      const prior = selAlert.get(dk) as { created_at: number } | undefined;
+      if (prior && nowSec - prior.created_at <= stateTtlSec) {
+        console.log(`[consensus] skip ${dk}: claimed by another process`);
+        continue;
+      }
+    }
+    if (send) {
+      try {
+        await send(formatConsensusAlert(g));
+      } catch (e) {
+        // Roll back a fresh claim so the group re-fires next cycle
+        // (at-least-once); a reminder wrote nothing, so nothing to undo.
+        // Known tradeoff: a crash BETWEEN claim and send loses that one push.
+        if (claimed) delAlert.run(dk);
+        throw e;
+      }
+    }
     ups.run(g.conditionId, g.outcome, g.walletCount, g.totalNetUsd, nowSec);
     fired++;
   }

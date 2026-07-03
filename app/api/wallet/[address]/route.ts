@@ -1,4 +1,10 @@
 import { openDb } from "../../../../lib/db";
+import {
+  ALERT_HITS_WINDOW_DAYS,
+  parseAlertHit,
+  queryAlertHitRows,
+  type AlertHit,
+} from "../../../../lib/alertHits";
 import { getWalletAges } from "../../../../lib/walletAge";
 import { getWalletStats } from "../../../../lib/walletStats";
 import { fetchPusdBalance } from "../../../../lib/pusdBalance";
@@ -37,51 +43,6 @@ function cacheProfile(
     profileCache.delete(oldest);
   }
   profileCache.set(address, entry);
-}
-
-// A row from this tool's own alert history involving the wallet.
-type AlertHit = {
-  type: string;
-  createdAt: number;
-  title: string;
-  outcome: string;
-  side: string;
-  usd: number;
-  price: number | null;
-};
-
-function parseAlertHit(row: {
-  type: string;
-  payload: string;
-  created_at: number;
-}): AlertHit | null {
-  try {
-    const p = JSON.parse(row.payload) as Record<string, unknown>;
-    if (row.type === "consensus") {
-      return {
-        type: row.type,
-        createdAt: row.created_at,
-        title: String(p.title ?? ""),
-        outcome: String(p.outcome ?? ""),
-        side: "BUY",
-        usd: Number(p.totalNetUsd ?? 0),
-        price: null,
-      };
-    }
-    const size = Number(p.size ?? 0);
-    const price = Number(p.price ?? 0);
-    return {
-      type: row.type,
-      createdAt: row.created_at,
-      title: String(p.title ?? ""),
-      outcome: String(p.outcome ?? ""),
-      side: String(p.side ?? ""),
-      usd: size * price,
-      price,
-    };
-  } catch {
-    return null;
-  }
 }
 
 export async function GET(
@@ -144,20 +105,9 @@ export async function GET(
         }))
         .sort((a, b) => b.usd - a.usd);
 
-      // This tool's own history with the wallet. proxyWallet lives inside the
-      // payload JSON (no dedicated column yet), and SQLite LIKE is ASCII
-      // case-insensitive, so a substring probe is exact enough here.
-      const alertHits = (
-        db
-          .prepare(
-            "SELECT type, payload, created_at FROM alerts WHERE payload LIKE ? ORDER BY created_at DESC LIMIT 50",
-          )
-          .all(`%${address}%`) as {
-          type: string;
-          payload: string;
-          created_at: number;
-        }[]
-      )
+      // This tool's own history with the wallet, bounded to the recent window
+      // (see lib/alertHits for the LIKE-probe and lower-bound rationale).
+      const alertHits = queryAlertHitRows(db, address)
         .map(parseAlertHit)
         .filter((h): h is AlertHit => h !== null);
 
@@ -171,6 +121,8 @@ export async function GET(
         profile: { ...profile, topMarkets },
         categories,
         alertHits,
+        // Surfaced so the page can label the coverage window it's showing.
+        alertHitsWindowDays: ALERT_HITS_WINDOW_DAYS,
         recent,
       });
     } finally {
